@@ -1,16 +1,16 @@
 {
   "expo": {
     "name": "Vora",
-    "slug": "V_Frontend",
+    "slug": "vora",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "vfrontend",
+    "scheme": "vora",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.walzia.voravia",
+      "bundleIdentifier": "com.vora.vora",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -48,12 +48,6 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    },
-    "extra": {
-      "router": {},
-      "eas": {
-        "projectId": "1fe84921-08d5-4dd1-8600-305a859b52be"
-      }
     },
     "owner": "jayakrishna18"
   }
