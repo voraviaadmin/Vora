@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "V_Frontend",
-    "slug": "V_Frontend",
+    "name": "Vora",
+    "slug": "vora",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
