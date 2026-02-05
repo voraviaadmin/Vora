@@ -10,7 +10,7 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.vora.vora",
+      "bundleIdentifier": "com.jayakrishna.vora",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -49,6 +49,12 @@
       "typedRoutes": true,
       "reactCompiler": true
     },
-    "owner": "jayakrishna18"
+    "owner": "jayakrishna18",
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "0b33bbf6-0056-43ed-8051-dc67fc486235"
+      }
+    }
   }
 }
