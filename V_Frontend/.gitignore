@@ -1,5 +1,16 @@
 # Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
+# macOS
+.DS_Store
+
+# env
+.env
+
+# sqlite
+*.db
+*.db-wal
+*.db-shm
+
 # dependencies
 node_modules/
 
