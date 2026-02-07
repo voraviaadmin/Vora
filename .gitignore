@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Env files
+.env
+
+# SQLite / local DB
+*.db
+*.db-wal
+*.db-shm
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# Logs
+*.log
