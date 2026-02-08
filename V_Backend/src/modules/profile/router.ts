@@ -40,6 +40,37 @@ export function profileRouter() {
  r.put("/preferences", (req, res) => res.json(saveProfilePreferences(req, req.body)));
 
 
+// Set profile mode (persisted server-side)
+r.put("/mode", (req, res) => {
+  const ctx = req.ctx; // however you attach it (resolveContext)
+  const userId = ctx?.userId;
+  const mode = String(req.body?.mode || "").toLowerCase();
+
+  if (mode !== "privacy" && mode !== "sync") {
+    return res.status(400).json({ error: "BAD_MODE" });
+  }
+
+  const db = req.app.locals.db;
+
+  // Upsert mode
+  db.prepare(
+    `
+    INSERT INTO profile_settings (userId, mode)
+    VALUES (?, ?)
+    ON CONFLICT(userId) DO UPDATE SET mode=excluded.mode
+  `
+  ).run(userId, mode);
+
+  return res.json({ ok: true, mode });
+});
+
+
+
+
+
+
+
+
 r.get("/trends", (req, res) => {
   const ctx = (req as any).ctx;
   const db = (req as any).app.locals.db;
@@ -142,3 +173,5 @@ r.get("/score-preview", (req, res) => {
 
   return r;
 }
+
+

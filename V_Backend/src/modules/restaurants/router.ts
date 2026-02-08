@@ -2,11 +2,29 @@ import express from "express";
 import crypto from "crypto";
 import type { Db } from "../../db/connection";
 import { apiErr, apiOk, requireSyncMode } from "../../middleware/resolveContext";
+import multer from "multer";
+import { decryptProfile } from "../profile/crypto"; // adjust path to your actual profile module
+import { getSyncPreferences } from "./preferences";
+import { getDbFromReq } from "../../db/connection";
+import { openAiScoreVision, openAiScoreText } from "./openai-score";
 
-function getDb(req: any): Db | null {
+
+
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    // Configurable; keep safe defaults. No hardcoding “magic”.
+    fileSize: Number(process.env.SCAN_OCR_MAX_BYTES ?? 6_000_000),
+  },
+});
+
+
+
+/*function getDb(req: any): Db | null {
   const db = req?.app?.locals?.db as Db | undefined;
   return db ?? null;
-}
+}*/
 
 function nowIso() {
   return new Date().toISOString();
@@ -29,6 +47,10 @@ function purgeExpired(db: Db) {
   const now = nowIso();
   db.prepare(`DELETE FROM user_restaurant_menu_snapshot WHERE expiresAt < ?`).run(now);
 }
+
+
+
+
 
 // Extract a safe, storage-ready item list (NO raw OCR)
 function normalizeSnapshotItems(payloadItems: any[]) {
@@ -127,8 +149,284 @@ export function restaurantsRouter() {
   return router;
 }
 
+function safeJsonParse(txt: string) {
+  const s = String(txt ?? "").trim();
+
+  // Strip ```json fences if present
+  const stripped = s
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  return JSON.parse(stripped);
+}
+
+
+async function openAiMenuScoreVision(args: {
+  apiKey: string;
+  model: string;
+  imageBuffer: Buffer;
+  mime: string;
+  preferences: any;
+}) {
+  const { apiKey, model, imageBuffer, mime, preferences } = args;
+
+  const b64 = imageBuffer.toString("base64");
+  const pref = preferences ?? null;
+
+  const prompt = {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text:
+`You are scoring restaurant menu items for a user.
+Use the user's profile preferences to score suitability.
+
+User preferences JSON:
+${JSON.stringify(pref)}
+
+Task:
+1) Extract menu items (food/drink) from the image.
+2) Return scored results per item.
+3) Keep reasons short and human-readable. No gibberish.
+4) If extraction is unreliable, lower confidence.
+
+Return STRICT JSON with:
+{
+  "items":[{"name":string,"score":number,"confidence":number,"reason":string}],
+  "rawLines":[string],
+  "overallConfidence":number
+}
+
+Rules:
+- score is 0..100
+- confidence is 0..1
+- reason max 140 chars
+- items max 40`
+      },
+      {
+        type: "input_image",
+        input_image: { url: `data:${mime};base64,${b64}` },
+      },
+    ],
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: [prompt],
+      temperature: 0.2,
+      max_output_tokens: 1200,
+    }),
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    console.error("OPENAI_FAIL_MENU_SCORE_VISION", resp.status, txt.slice(0, 400));
+    throw new Error(`OPENAI_VISION_FAILED:${resp.status}:${txt.slice(0, 250)}`);
+  }
+
+  const json = await resp.json();
+
+  // Responses API returns content in output[].content[].text; keep it defensive
+  const outText =
+    json?.output?.[0]?.content?.find((c: any) => c?.type === "output_text")?.text ??
+    json?.output_text ??
+    "";
+
+  // Strict JSON parse
+  let parsed: any = null;
+  try {
+    parsed = safeJsonParse(outText);
+  } catch {
+    parsed = null;
+  }
+
+  return parsed;
+}
+
+async function openAiMenuScoreText(args: {
+  apiKey: string;
+  model: string;
+  items: { name: string }[];
+  preferences: any;
+}) {
+  const { apiKey, model, items, preferences } = args;
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+`You are scoring selected menu items for a user.
+User preferences JSON:
+${JSON.stringify(preferences ?? null)}
+
+Selected items:
+${JSON.stringify(items)}
+
+Return STRICT JSON:
+{
+  "items":[{"name":string,"score":number,"confidence":number,"reason":string}],
+  "overallConfidence":number
+}
+
+Rules:
+- score 0..100
+- confidence 0..1
+- reason max 140 chars
+- items must match provided names (no hallucinated items)`
+            },
+          ],
+        },
+      ],
+      temperature: 0.2,
+      max_output_tokens: 900,
+    }),
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    console.error("OPENAI_FAIL_MENU_SCORE_TEXT", resp.status, txt.slice(0, 250));
+    throw new Error(`OPENAI_TEXT_FAILED:${resp.status}:${txt.slice(0, 250)}`);
+  }
+
+  const json = await resp.json();
+  const outText =
+    json?.output?.[0]?.content?.find((c: any) => c?.type === "output_text")?.text ??
+    json?.output_text ??
+    "";
+
+  let parsed: any = null;
+  try {
+    parsed = safeJsonParse(outText);
+  } catch {
+    parsed = null;
+  }
+  return parsed;
+}
+
+function clamp01(x: any) {
+  const n = typeof x === "number" ? x : Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function clampScore(x: any) {
+  const n = typeof x === "number" ? x : Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
 export function syncEatOutRouter() {
   const router = express.Router();
+
+
+  router.get("/restaurants/nearby", requireSyncMode(), async (req, res) => {
+    try {
+      const apiKey = String(process.env.GOOGLE_PLACES_API_KEY ?? "").trim();
+      if (!apiKey) {
+        const r = apiErr(req, "MISSING_GOOGLE_API_KEY", "Nearby search is not configured.", "Try again later.", 500, false);
+        return res.status(r.status).json(r.body);
+      }
+  
+      const lat = Number(req.query.lat);
+      const lng = Number(req.query.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        const r = apiErr(req, "MISSING_LOCATION", "Missing location.", "Enable location and try again.", 400, true);
+        return res.status(r.status).json(r.body);
+      }
+  
+      const radiusMeters = Number(req.query.radius_meters ?? process.env.EATOUT_PLACES_RADIUS_METERS ?? 8000);
+      const cuisinesRaw = String(req.query.cuisines ?? "").trim(); // comma-separated
+      const q = String(req.query.q ?? "").trim();
+  
+      const prefs = getSyncPreferences(req);
+      const cuisines = cuisinesRaw
+        ? cuisinesRaw.split(",").map(s => s.trim()).filter(Boolean)
+        : Array.isArray(prefs?.cuisines) ? prefs.cuisines : [];
+  
+      // Phase 1 query policy: user-triggered only, flexible text search
+      const query = q || (cuisines.length ? cuisines.slice(0, 5).join(" OR ") : "restaurants");
+  
+      const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask": [
+            "places.id",
+            "places.displayName",
+            "places.formattedAddress",
+            "places.rating",
+            "places.priceLevel",
+            "places.primaryType",
+            "places.types",
+          ].join(","),
+        },
+        body: JSON.stringify({
+          textQuery: query,
+          locationBias: {
+            circle: {
+              center: { latitude: lat, longitude: lng },
+              radius: Math.max(1000, Math.min(50000, Number(radiusMeters) || 8000)),
+            },
+          },
+          includedType: "restaurant",
+          maxResultCount: 20,
+        }),
+      });
+  
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => "");
+        console.error("PLACES_FAIL_NEARBY", resp.status, txt.slice(0, 250));
+        const r = apiErr(req, "PLACES_FAILED", "Nearby search failed.", "Try again.", 502, true);
+        return res.status(r.status).json({ ...r.body, debug: { status: resp.status, body: txt.slice(0, 300) } });
+      }
+  
+      const json = await resp.json();
+      const places = Array.isArray(json?.places) ? json.places : [];
+  
+      const results = places
+        .map((p: any) => ({
+          placeRefId: String(p?.id ?? "").trim(),
+          name: String(p?.displayName?.text ?? p?.displayName ?? "").trim() || "Unknown",
+          addressShort: String(p?.formattedAddress ?? "").trim() || null,
+          rating: typeof p?.rating === "number" ? p.rating : null,
+          priceLevel: typeof p?.priceLevel === "number" ? p.priceLevel : null,
+          primaryType: String(p?.primaryType ?? "").trim() || null,
+          types: Array.isArray(p?.types) ? p.types : [],
+        }))
+        .filter((x: any) => !!x.placeRefId);
+  
+      return res.json(apiOk(req, { results }));
+    } catch {
+      const r = apiErr(req, "NEARBY_FAILED", "We couldn’t search restaurants.", "Try again.", 500, true);
+      return res.status(r.status).json(r.body);
+    }
+  });
+  
+  
+
+
+
 
   // Phase 1: ingest (existing)
   router.post("/menu/ingest", requireSyncMode(), (req, res) => {
@@ -171,24 +469,146 @@ export function syncEatOutRouter() {
   });
 
   // Phase 1: score (existing)
-  router.post("/menu/score", requireSyncMode(), (req, res) => {
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (!items.length) {
-      const r = apiErr(req, "MISSING_ITEMS", "No menu items provided to score.", "Ingest a menu first or provide items[].", 400, true);
-      return res.status(r.status).json(r.body);
+  router.post(
+    "/menu/score",
+    requireSyncMode(),
+    upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),
+    async (req, res) => {
+      try {
+        const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+        if (!apiKey) {
+          const r = apiErr(req, "MISSING_OPENAI_KEY", "Menu scoring is not configured.", "Try again later.", 500, false);
+          return res.status(r.status).json(r.body);
+        }
+  
+        const prefs = getSyncPreferences(req);
+        const lowThresh = Number(process.env.EATOUT_LOW_CONFIDENCE_THRESHOLD ?? 0.55);
+  
+        const files = req.files as any;
+        const f = files?.file?.[0] ?? files?.image?.[0];
+  
+        const bodyItems = Array.isArray(req.body?.items) ? req.body.items : [];
+        const items = bodyItems
+          .map((it: any) => ({ name: String(it?.name ?? "").trim() }))
+          .filter((x: any) => !!x.name)
+          .slice(0, 50);
+
+
+          console.log("MENU_SCORE_INPUT", {
+            hasFile: Boolean(f?.buffer),
+            itemsCount: items.length,
+            hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+          });
+          
+  
+        let parsed: any = null;
+  
+        if (f?.buffer) {
+          const mime = String(f.mimetype ?? "").toLowerCase();
+          const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+          if (!allowed.has(mime)) {
+            const r = apiErr(req, "UNSUPPORTED_MEDIA", "Menu scan requires an image.", "Upload JPG/PNG/WebP.", 415, true);
+            return res.status(r.status).json(r.body);
+          }
+  
+          parsed = await openAiScoreVision({
+            apiKey,
+            model: String(process.env.OPENAI_VISION_MODEL ?? "gpt-4o-mini"),
+            imageBuffer: f.buffer,
+            mime,
+            preferences: prefs,
+          });
+        } else {
+          if (!items.length) {
+            const r = apiErr(req, "MISSING_ITEMS", "No menu items provided.", "Scan the menu or select items manually.", 400, true);
+            return res.status(r.status).json(r.body);
+          }
+  
+          parsed = await openAiScoreText({
+            apiKey,
+            model: String(process.env.OPENAI_TEXT_MODEL ?? "gpt-4o-mini"),
+            items,
+            preferences: prefs,
+          });
+        }
+  
+        if (!parsed || !Array.isArray(parsed.items)) {
+          const r = apiErr(req, "AI_BAD_OUTPUT", "We couldn’t read the menu reliably.", "Try Manual Select.", 502, true);
+          return res.status(r.status).json({
+            ...r.body,
+            data: {
+              ranked: [],
+              overallConfidence: 0,
+              fallbackRecommended: true,
+              fallbackReason: "MODEL_OUTPUT_INVALID",
+              extracted: { rawLines: Array.isArray(parsed?.rawLines) ? parsed.rawLines : [], notes: [] },
+            },
+          });
+        }
+  
+        const ranked = parsed.items
+          .map((it: any, idx: number) => {
+            const name = String(it?.name ?? "").trim();
+            if (!name) return null;
+  
+            const scoreVal = clampScore(it?.score);
+            const conf = clamp01(it?.confidence);
+  
+            return {
+              itemId: `item-${idx}`,
+              name,
+              score: {
+                value: scoreVal,
+                label: scoreVal >= 80 ? "Great" : scoreVal >= 65 ? "Good" : "Needs work",
+                kind: "personalized",
+              },
+              confidence: conf,
+              why: [String(it?.reason ?? "").trim()].filter(Boolean).slice(0, 1),
+              safeFallback: { shown: false, reason: null },
+            };
+          })
+          .filter(Boolean)
+          .slice(0, 40);
+  
+        const overallConfidence = clamp01(
+          parsed?.overallConfidence ??
+            (ranked.length
+              ? ranked.reduce((a: number, r: any) => a + (r.confidence ?? 0), 0) / ranked.length
+              : 0)
+        );
+  
+        const fallbackRecommended = overallConfidence < lowThresh || ranked.length === 0;
+  
+        return res.json(
+          apiOk(req, {
+            ranked,
+            overallConfidence,
+            fallbackRecommended,
+            fallbackReason: fallbackRecommended ? (ranked.length === 0 ? "NO_ITEMS_EXTRACTED" : "LOW_CONFIDENCE") : null,
+            extracted: {
+              rawLines: Array.isArray(parsed?.rawLines)
+                ? parsed.rawLines.slice(0, 160).map((s: any) => String(s ?? "").trim()).filter(Boolean)
+                : [],
+              notes: [],
+            },
+          })
+        );
+      } catch {
+        const r = apiErr(req, "MENU_SCORE_FAILED", "We couldn’t score this menu.", "Try Manual Select.", 502, true);
+        return res.status(r.status).json({
+          ...r.body,
+          data: {
+            ranked: [],
+            overallConfidence: 0,
+            fallbackRecommended: true,
+            fallbackReason: "VISION_OR_PROVIDER_FAILED",
+          },
+        });
+      }
     }
-
-    const ranked = items.map((it: any, idx: number) => ({
-      itemId: String(it.itemId ?? `item-${idx}`),
-      name: String(it.name ?? "").trim(),
-      score: { value: 75, label: "Good", kind: "personalized" },
-      confidence: 0.7,
-      why: ["Personalized ranking stub (AI provider wiring next)."],
-      safeFallback: { shown: false, reason: null },
-    }));
-
-    return res.json(apiOk(req, { ranked }));
-  });
+  );
+  
+  
 
   /**
    * Snapshot endpoints (Overwrite + 30-day retention)
@@ -201,7 +621,7 @@ export function syncEatOutRouter() {
 
   // Fast status for restaurant list UI
   router.get("/restaurants/snapshots/status", requireSyncMode(), (req, res) => {
-    const db = getDb(req);
+    const db = getDbFromReq(req);
     if (!db) {
       const r = apiErr(req, "DB_NOT_AVAILABLE", "Database not available.", "Restart backend.", 500, false);
       return res.status(r.status).json(r.body);
@@ -241,8 +661,8 @@ export function syncEatOutRouter() {
       return {
         placeRefId,
         hasSnapshot: !!row,
-        updatedAt: row?.updatedAt ?? null,
-        expiresAt: row?.expiresAt ?? null,
+        updatedAt: (row as any)?.updatedAt ?? null,
+        expiresAt: (row as any)?.expiresAt ?? null,
       };
     });
 
@@ -251,7 +671,7 @@ export function syncEatOutRouter() {
 
   // View snapshot (no AI call)
   router.get("/restaurants/:placeRefId/menu/snapshot", requireSyncMode(), (req, res) => {
-    const db = getDb(req);
+    const db = getDbFromReq(req);
     if (!db) {
       const r = apiErr(req, "DB_NOT_AVAILABLE", "Database not available.", "Restart backend.", 500, false);
       return res.status(r.status).json(r.body);
@@ -314,7 +734,7 @@ export function syncEatOutRouter() {
 
 
   const upsertSnapshotHandler = (req: any, res: any) => {
-    const db = getDb(req);
+    const db = getDbFromReq(req);
     if (!db) {
       const r = apiErr(req, "DB_NOT_AVAILABLE", "Database not available.", "Restart backend.", 500, false);
       return res.status(r.status).json(r.body);

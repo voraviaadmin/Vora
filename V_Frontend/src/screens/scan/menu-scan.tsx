@@ -9,28 +9,46 @@ import {
   TextInput,
   View,
   Image,
+  Pressable,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as ImagePicker from "expo-image-picker";
-
 import { UI } from "../../theme/ui";
 import { useModeGate } from "../../hooks/use-mode-gate";
 import { Button } from "../../../components/ui/button";
+import { detectMenuTextBoxes } from "../../utils/menuDetection";
+import { parseMenuToItemsText } from "../../utils/menu-parse";
+import { syncEatOutMenuScore, syncEatOutMenuScoreVision, syncEatOutPutSnapshot, syncEatOutGetSnapshot } from "../../api/meal-scoring";
+import { buildMenuCandidates, foldDescriptions } from "../../utils/menu-parse";
+import { getLocalMenuDraft, upsertLocalMenuDraft, clearLocalMenuDraft } from "../../storage/local-logs";
+import { normalizeReasons } from "../../utils/score-explain";
 
-/**
- * Phase 1 design:
- * - Privacy: on-device detection (Vision/ML Kit) + tap-to-select
- * - Sync: OpenAI scoring (selected items only)
- *
- * This screen implements the *camera capture* and a clean UX scaffold.
- * It does NOT dump OCR text (no gibberish).
- *
- * Next step (you will add later):
- * - Implement detectMenuItemsOnDevice(photoUri) to return candidate items.
- * - Render tappable overlays (boxes) to select items.
- */
+
+
+
 
 type SelectedItem = { id: string; name: string };
+type CandidateItem = { id: string; name: string; confidence: number };
+
+function uniqByLower(items: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of items) {
+    const k = s.trim().toLowerCase();
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s.trim());
+  }
+  return out;
+}
+
+function draftKey(placeRefId: string) {
+  return `vora.menuScanDraft.${placeRefId}`;
+}
+
+
+
 
 export default function MenuScanScreen() {
   const router = useRouter();
@@ -38,20 +56,32 @@ export default function MenuScanScreen() {
     placeRefId?: string;
     restaurantName?: string;
     returnTo?: string;
+    mealType?: string;
   }>();
+  
+  
 
-  const placeRefId = String(params.placeRefId ?? "").trim();
-  const restaurantName = String(params.restaurantName ?? "").trim();
-  const returnTo = String(params.returnTo ?? "").trim();
+  const placeRefId = String(params.placeRefId ?? "scan").trim();
+  const restaurantName = String(params.restaurantName ?? "Scanned menu").trim();
+  const returnTo = String(params.returnTo ?? "/(tabs)/scan").trim();
+  const mealType = String(params.mealType ?? "").trim();
+  
 
   const { mode } = useModeGate();
   const isSync = mode === "sync";
 
   const [photoUri, setPhotoUri] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [scoring, setScoring] = useState(false);
+const [fallbackRecommended, setFallbackRecommended] = useState(false);
+const [fallbackReason, setFallbackReason] = useState<string | null>(null);
 
-  // Temporary manual fallback (until Vision/MLKit detection is wired)
+
+  // Manual fallback (0% patience users need an escape hatch)
   const [manualText, setManualText] = useState("");
+  const [candidates, setCandidates] = useState<CandidateItem[]>([]);
   const [selected, setSelected] = useState<SelectedItem[]>([]);
 
   const title = useMemo(() => {
@@ -60,12 +90,83 @@ export default function MenuScanScreen() {
   }, [restaurantName]);
 
   useEffect(() => {
-    // On enter, open camera immediately
+
     if (!photoUri) {
       void openCamera();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+
+  useEffect(() => {
+    if (!placeRefId) return;
+  
+    (async () => {
+      const draft = await getLocalMenuDraft(placeRefId);
+      if (!draft?.items?.length) return;
+  
+      setSelected((prev) => {
+        if (prev.length) return prev; // don't clobber active session
+        return draft.items.map((name, idx) => ({
+          id: `draft-${idx}-${name.toLowerCase()}`,
+          name,
+        }));
+      });
+    })();
+  }, [placeRefId]);
+  
+
+  async function runVisionScore(uri: string) {
+    setScoring(true);
+    setFallbackRecommended(false);
+    setFallbackReason(null);
+  
+    try {
+      const resp = await syncEatOutMenuScoreVision(
+        { uri, name: "menu.jpg", type: "image/jpeg" },
+        { mode: "sync" }
+      );
+  
+      const ranked = resp?.data?.ranked ?? [];
+      const overallConfidence = resp?.data?.overallConfidence ?? 0;
+      const fallback = Boolean(resp?.data?.fallbackRecommended);
+  
+      if (fallback || !ranked.length) {
+        setFallbackRecommended(true);
+        setFallbackReason(resp?.data?.fallbackReason ?? "LOW_CONFIDENCE");
+        // Now show manual UI: run on-device detection as helper
+        await runDetection(uri);
+        return;
+      }
+  
+      // Save snapshot immediately (zero patience)
+      const snapshotItems = ranked.map((r) => ({
+        name: r.name,
+        scoreValue: r.score?.value ?? undefined,
+        scoreLabel: r.score?.label ?? undefined,
+        reasons: Array.isArray(r.why) ? r.why : [],
+        flags: [],
+      }));
+
+  
+      await clearLocalMenuDraft(placeRefId);
+  
+      router.replace({
+        pathname: "/eatout/menu-view",
+        params: { placeRefId, restaurantName, mealType },
+      });
+    } catch (e: any) {
+      // Provider failure → manual fallback
+      setFallbackRecommended(true);
+      setFallbackReason("PROVIDER_FAILED");
+      await runDetection(uri);
+    } finally {
+      setScoring(false);
+    }
+  }
+  
+
+
 
   async function openCamera() {
     setBusy(true);
@@ -96,10 +197,15 @@ export default function MenuScanScreen() {
 
       setPhotoUri(uri);
 
-      // Future hook:
-      // const detected = await detectMenuItemsOnDevice(uri)
-      // setSelectedCandidates(detected)
-      // For now, we do nothing (no gibberish).
+      if (isSync) {
+        void runVisionScore(uri);
+      } else {
+        void runDetection(uri);
+      }
+      
+
+      // Phase 1: on-device detection -> parsed candidates list
+      void runDetection(uri);
     } catch (e: any) {
       Alert.alert("Scan failed", e?.message ?? "Please try again.");
       router.back();
@@ -108,35 +214,257 @@ export default function MenuScanScreen() {
     }
   }
 
+  async function runDetection(uri: string) {
+    setDetecting(true);
+    try {
+      const boxes = await detectMenuTextBoxes(uri);
+      const rawLines = boxes.map((b) => b.text);
+      const folded = foldDescriptions(rawLines);
+  
+      const candidates = buildMenuCandidates(folded);
+  
+
+      setCandidates(
+        candidates.map((c, idx) => ({
+          id: `c-${idx}-${c.norm}`,
+          name: c.text,
+          confidence: c.confidence,
+        }))
+      );
+  
+
+      setSelected((prev) => prev); // never auto-select
+
+
+
+    } catch {
+      setCandidates([]);
+    } finally {
+      setDetecting(false);
+    }
+  }
+  
+
   function addManualItem() {
     const name = manualText.trim();
     if (!name) return;
-    setSelected((prev) => [...prev, { id: `m-${Date.now()}`, name }]);
+    addSelectedName(name, `m-${Date.now()}`);
     setManualText("");
+  }
+
+  function addSelectedName(name: string, id: string) {
+    const n = name.trim();
+    if (!n) return;
+    setSelected((prev) => {
+      const exists = prev.some((x) => x.name.trim().toLowerCase() === n.toLowerCase());
+      if (exists) return prev;
+      return [...prev, { id, name: n }];
+    });
+  }
+
+  function toggleCandidate(item: CandidateItem) {
+    const lower = item.name.trim().toLowerCase();
+    setSelected((prev) => {
+      const exists = prev.some((x) => x.name.trim().toLowerCase() === lower);
+      if (exists) return prev.filter((x) => x.name.trim().toLowerCase() !== lower);
+      return [...prev, { id: item.id, name: item.name }];
+    });
   }
 
   function removeItem(id: string) {
     setSelected((prev) => prev.filter((x) => x.id !== id));
   }
 
-  function done() {
-    // For now just go back; later you’ll score + save snapshot in Sync mode.
-    // Keep UX clean + non-buggy.
-    router.back();
+  function back() {
+    if (returnTo) router.replace(returnTo as any);
+    else router.back();
   }
 
-  async function scoreSelected() {
-    // Placeholder until you wire OpenAI scoring for selected items.
-    // We keep this button here to lock the UX, but don’t send junk.
+  function normName(s: string) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+  
+  function mergeByName(existing: any[], incoming: any[]) {
+    const map = new Map<string, any>();
+  
+    // keep existing first (so it preserves older score/itemId if present)
+    for (const it of existing || []) {
+      const key = normName(it?.name);
+      if (!key) continue;
+      if (!map.has(key)) map.set(key, it);
+    }
+  
+    // add incoming only if new
+    for (const it of incoming || []) {
+      const key = normName(it?.name);
+      if (!key) continue;
+      if (!map.has(key)) map.set(key, it);
+    }
+  
+    return Array.from(map.values());
+  }
+  
+  
+
+  async function saveSyncSnapshotAndOpen() {
     if (!selected.length) {
       Alert.alert("Select items", "Add or select at least one menu item.");
       return;
     }
+    if (!isSync) {
+      Alert.alert(
+        "Privacy mode",
+        "Privacy mode does not send data to the backend or score items. Switch to Sync mode to score and save a menu snapshot."
+      );
+      return;
+    }
+
+    setSaving(true);
+    try {
+      // 1) score selected items
+      const scoreResp = await syncEatOutMenuScore(
+        {
+          items: selected.map((s, idx) => ({
+            itemId: `sel-${idx}-${s.name.toLowerCase().replace(/\s+/g, "-")}`,
+            name: s.name,
+          })),
+        },
+        { mode: "sync" }
+      );
+
+      // 2) persist snapshot (overwrite allowed; backend enforces 30-day expiry)
+// build items from this save
+const ranked = scoreResp?.data?.ranked ?? [];
+const snapshotItems =
+  ranked.length > 0
+    ? ranked.map((r: any) => ({
+        name: r.name,
+        scoreValue: r.score?.value ?? undefined,
+        scoreLabel: r.score?.label ?? undefined,
+        reasons: Array.isArray(r.why) ? r.why : [],
+        flags: [],
+      }))
+    : selected.map((s) => ({ name: s.name }));
+
+// 1) compute newItems from this scan
+const newItems =
+  snapshotItems.length ? snapshotItems : selected.map((s) => ({ name: s.name }));
+
+// 2) rawLines must come from SCORE response (best) or parsed fallback
+const newRawLines: string[] =
+  scoreResp?.data?.extracted?.rawLines ?? [];
+
+// 3) fetch existing snapshot (if any) + existing rawLines
+let existingItems: any[] = [];
+let existingRawLines: string[] = [];
+
+try {
+  const prev = await syncEatOutGetSnapshot(placeRefId, { mode: "sync" });
+
+  // IMPORTANT: your API seems to wrap in `.data`
+  existingItems = Array.isArray(prev?.data?.snapshot?.items) ? prev.data.snapshot.items : [];
+  existingRawLines = Array.isArray(prev?.data?.snapshot?.extracted?.rawLines)
+    ? prev.data.snapshot.extracted.rawLines
+    : [];
+} catch {
+  // ok if none exists
+}
+
+// 4) merge + dedupe
+const mergedItems = mergeByName(existingItems, newItems);
+
+const mergedRawLines = Array.from(
+  new Set(
+    [...existingRawLines, ...newRawLines]
+      .map((s) => String(s).trim())
+      .filter(Boolean)
+  )
+);
+
+// 5) ONE write (upsert)
+await syncEatOutPutSnapshot(
+  placeRefId,
+  {
+    menuSource: "scan_camera",
+    confidence: 1, // Sync mode: ignore confidence
+    items: mergedItems,
+  },
+  { mode: "sync" }
+);
+
+
+
+      await clearLocalMenuDraft(placeRefId);
+
+
+
+
+      // 3) navigate to view screen (new page, no inline expand)
+      router.replace({
+        pathname: "/eatout/menu-view",
+        params: { placeRefId, restaurantName, mealType },
+      });
+      
+    } catch (e: any) {
+      const modeBlocked =
+        e?.message === "MODE_BLOCKED" ||
+        e?.code === "MODE_BLOCKED";
+    
+      const msg =
+        modeBlocked
+          ? "Switch to Sync mode to score and save."
+          : (e?.response?.data?.error?.message ||
+             e?.response?.data?.message ||
+             e?.message ||
+             (typeof e === "string" ? e : JSON.stringify(e, null, 2)));
+    
+      Alert.alert("Could not save menu", msg);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function resolveReturnTo(rt: string | undefined) {
+    const v = (rt ?? "").trim();
+    if (!v) return "/(tabs)/eat-out";
+    // Accept only absolute in-app routes
+    if (v.startsWith("/")) return v;
+    // Back-compat for older callers that used "eatout"
+    if (v === "eat-out") return "/(tabs)/eat-out";
+    return "/(tabs)/eat-out";
+  }
+  
+
+
+  async function donePrivacy() {
+    if (!selected.length) {
+      Alert.alert("Add at least one item", "Select or add at least one menu item to continue.");
+      return;
+    }
+  
+    // Merge/upsert (2nd page scan adds items; no surprises)
+    await upsertLocalMenuDraft(
+      placeRefId,
+      selected.map((s) => s.name),
+      { merge: true }
+    );
+  
     Alert.alert(
-      "Scoring not wired yet",
-      "Next step: on-device detection (Privacy) + OpenAI scoring (Sync) for selected items only."
+      "Saved locally (30 days)",
+      "Privacy mode keeps this on your device only. Switch to Sync to score and save a snapshot.",
+      [
+        {
+          text: "OK",
+          onPress: () => router.replace("/(tabs)/eat-out" as any),
+        },
+      ]
     );
   }
+  
+  
 
   return (
     <KeyboardAvoidingView
@@ -152,9 +480,13 @@ export default function MenuScanScreen() {
       >
         <Text style={styles.title}>{title}</Text>
         <Text style={styles.sub}>
-          {isSync
-            ? "Sync mode: you’ll score selected items with AI (no full OCR dump)."
-            : "Privacy mode: on-device scan only (no uploads)."}
+        {isSync
+  ? scoring
+    ? "Scanning… then scoring with your profile."
+    : fallbackRecommended
+      ? "We’re not confident reading this menu. Use Manual Select."
+      : "Sync mode: scan + score automatically (profile-aware)."
+  : "Privacy mode: on-device scan only (nothing sent)."}
         </Text>
 
         <View style={styles.card}>
@@ -169,140 +501,182 @@ export default function MenuScanScreen() {
           )}
 
           <View style={{ flexDirection: "row", gap: UI.spacing.md, marginTop: UI.spacing.md }}>
+            <Button title={busy ? "Opening…" : "Retake"} onPress={openCamera} disabled={busy || saving} />
             <Button
-              title={busy ? "Opening…" : "Retake"}
-              onPress={openCamera}
-              disabled={busy}
-              style={{ borderWidth: 1, borderColor: UI.colors.primary.apricot, flex: 1 }}
-            />
-            <Button
-              title="Close"
-              onPress={done}
-              variant="ghost"
-              style={{ borderWidth: 1, borderColor: UI.colors.outline, flex: 1 }}
+              title={scoring ? "Scoring…" : saving ? "Saving…" : isSync ? "Score & Save" : "Done"}
+              onPress={isSync ? saveSyncSnapshotAndOpen : donePrivacy}
+              disabled={busy || detecting || saving || scoring}
+              variant={isSync ? "default" : "ghost"}
             />
           </View>
-
-          <Text style={styles.note}>
-            Next: we’ll add tap-to-select boxes (Vision / ML Kit). This screen will never show raw OCR text.
-          </Text>
         </View>
 
-        {/* Temporary fallback (kept clean). You can remove later once tap-to-select is wired. */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Add an item (temporary fallback)</Text>
-          <Text style={styles.cardSub}>
-            If scan detection isn’t wired yet, add just the dish name. We’ll replace this with tap-to-select.
-          </Text>
 
-          <View style={styles.row}>
-            <TextInput
-              value={manualText}
-              onChangeText={setManualText}
-              placeholder="e.g., Bibimbap"
-              placeholderTextColor={UI.colors.textDim}
-              style={styles.input}
-              returnKeyType="done"
-              onSubmitEditing={addManualItem}
-            />
-            <Button
-              title="Add"
-              onPress={addManualItem}
-              style={{ borderWidth: 1, borderColor: UI.colors.primary.apricot }}
-            />
-          </View>
+        {(!isSync || fallbackRecommended) && (
+          <>
+            <View style={styles.section}>
+              <Text style={styles.h2}>Tap dishes you’re considering</Text>
+              <Text style={styles.note}>
+                {detecting
+                  ? "Scanning menu…"
+                  : candidates.length
+                  ? "Tap to select. You can also add manually below."
+                  : "Nothing detected. Add items manually (fast) or retake with better lighting."}
+              </Text>
 
-          {selected.length ? (
-            <View style={{ marginTop: UI.spacing.md }}>
-              <Text style={styles.cardTitle}>Selected ({selected.length})</Text>
-              {selected.map((it) => (
-                <View key={it.id} style={styles.selRow}>
-                  <Text style={{ color: UI.colors.text, fontWeight: "800", flex: 1 }}>{it.name}</Text>
-                  <Button
-                    title="Remove"
-                    variant="ghost"
-                    onPress={() => removeItem(it.id)}
-                    style={{ borderWidth: 1, borderColor: UI.colors.outline }}
-                  />
+              {candidates.length > 0 && (
+                <View style={styles.chipWrap}>
+                  {candidates.map((c) => {
+                    const isOn = selected.some((s) => s.name.trim().toLowerCase() === c.name.trim().toLowerCase());
+                    return (
+                      <Pressable
+                        key={c.id}
+                        onPress={() => toggleCandidate(c)}
+                        style={[
+                          styles.chip,
+                          { borderColor: isOn ? UI.colors.primary.apricot : UI.colors.cardBorder },
+                          isOn ? styles.chipOn : null,
+                        ]}
+                      >
+                        <Text style={{ color: UI.colors.text }}>{c.name}</Text>
+                        
+                      </Pressable>
+                    );
+                  })}
                 </View>
-              ))}
+              )}
             </View>
-          ) : null}
+      
+              <View style={styles.section}>
+                <Text style={styles.h2}>Manual add</Text>
+                <Text style={styles.note}>Paste a line item name (quickest fallback).</Text>
 
-          <View style={{ flexDirection: "row", gap: UI.spacing.md, marginTop: UI.spacing.lg }}>
-            <Button
-              title={isSync ? "Score selected" : "Done"}
-              onPress={isSync ? scoreSelected : done}
-              style={{ borderWidth: 1, borderColor: UI.colors.primary.apricot, flex: 1 }}
-            />
+                <View style={{ flexDirection: "row", gap: UI.spacing.md, alignItems: "center" }}>
+                  <TextInput
+                    value={manualText}
+                    onChangeText={setManualText}
+                    placeholder="e.g., Grilled salmon"
+                    placeholderTextColor={UI.colors.textDim}
+                    style={styles.input}
+                    returnKeyType="done"
+                    onSubmitEditing={addManualItem}
+                  />
+                  <Button title="Add" onPress={addManualItem} disabled={!manualText.trim() || saving} />
+                </View>
+              </View>
+
+              <View style={styles.section}>
+                <Text style={styles.h2}>Selected</Text>
+                {!selected.length ? (
+                  <Text style={styles.note}>Nothing selected yet.</Text>
+                ) : (
+                  <View style={{ gap: UI.spacing.sm }}>
+                    {selected.map((s) => (
+                      <View key={s.id} style={styles.row}>
+                        <Text style={{ color: UI.colors.text, flex: 1 }}>{s.name}</Text>
+                        <Pressable onPress={() => removeItem(s.id)} hitSlop={10}>
+                          <Text style={{ color: UI.colors.status.danger }}>Remove</Text>
+                        </Pressable>
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </View>
+              </>
+         )}
+
+
+        {!isSync && (
+          <View style={styles.banner}>
+            <Text style={styles.bannerTitle}>Privacy mode</Text>
+            <Text style={styles.bannerText}>
+              We won’t score or save to backend in Privacy mode. Switch to Sync mode to get “View menu (Scored)” and 30-day snapshots.
+            </Text>
           </View>
-        </View>
-
-        <Text style={styles.footer}>
-          Restaurant: {placeRefId || "—"} {returnTo ? `· Return: ${returnTo}` : ""}
-        </Text>
+        )}
       </ScrollView>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
-  title: { fontSize: 22, fontWeight: "900", color: UI.colors.text },
-  sub: { marginTop: 6, color: UI.colors.textDim },
-
-  card: {
-    marginTop: UI.spacing.lg,
-    padding: UI.spacing.lg,
-    borderRadius: UI.radius.lg,
-    backgroundColor: UI.colors.surface,
-    borderWidth: 1,
-    borderColor: UI.colors.outline,
+  title: {
+    color: UI.colors.text,
+    fontSize: 22,
+    fontWeight: "700",
+    marginBottom: 6,
   },
-
+  sub: {
+    color: UI.colors.textDim,
+    marginBottom: UI.spacing.lg,
+  },
+  card: {
+    backgroundColor: UI.colors.cardBg,
+    borderRadius: UI.radius.lg,
+    padding: UI.spacing.lg,
+    borderWidth: 1,
+    borderColor: UI.colors.cardBorder,
+  },
   photo: {
     width: "100%",
-    height: 320,
-    borderRadius: UI.radius.lg,
-    borderWidth: 1,
-    borderColor: UI.colors.outline,
-    backgroundColor: "#000",
+    height: 240,
+    borderRadius: UI.radius.md,
+    backgroundColor: UI.colors.canvas,
   },
   photoPlaceholder: {
     width: "100%",
-    height: 220,
-    borderRadius: UI.radius.lg,
-    borderWidth: 1,
-    borderColor: UI.colors.outline,
+    height: 240,
+    borderRadius: UI.radius.md,
+    backgroundColor: UI.colors.canvas,
     alignItems: "center",
     justifyContent: "center",
   },
-
-  note: { marginTop: UI.spacing.md, color: UI.colors.textDim },
-
-  cardTitle: { color: UI.colors.text, fontWeight: "900", fontSize: 16 },
-  cardSub: { color: UI.colors.textDim, marginTop: 4 },
-
-  row: { flexDirection: "row", gap: UI.spacing.md, marginTop: UI.spacing.md, alignItems: "center" },
+  section: { marginTop: UI.spacing.xl },
+  h2: { color: UI.colors.text, fontSize: 16, fontWeight: "700", marginBottom: 6 },
+  note: { color: UI.colors.textDim, marginBottom: UI.spacing.md },
   input: {
     flex: 1,
     borderWidth: 1,
-    borderColor: UI.colors.outline,
+    borderColor: UI.colors.cardBorder,
     borderRadius: UI.radius.md,
+    paddingHorizontal: UI.spacing.md,
+    paddingVertical: Platform.OS === "ios" ? 12 : 10,
+    color: UI.colors.text,
+    backgroundColor: UI.colors.pill.neutralBg,
+  },
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: UI.spacing.md,
+    padding: UI.spacing.md,
+    borderWidth: 1,
+    borderColor: UI.colors.cardBorder,
+    borderRadius: UI.radius.md,
+    backgroundColor: UI.colors.cardBg,
+  },
+  chipWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: UI.spacing.sm,
+  },
+  chip: {
     paddingHorizontal: 12,
     paddingVertical: 10,
-    color: UI.colors.text,
-    backgroundColor: UI.colors.bg,
+    borderRadius: 999,
+    borderWidth: 1,
+    backgroundColor: UI.colors.cardBg,
   },
-
-  selRow: {
-    marginTop: 10,
-    paddingTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: UI.colors.outline,
-    flexDirection: "row",
-    gap: UI.spacing.md,
-    alignItems: "center",
+  chipOn: {
+    backgroundColor: UI.colors.pill.neutralBg,
   },
-
-  footer: { marginTop: UI.spacing.lg, color: UI.colors.textDim, textAlign: "center" },
+  banner: {
+    marginTop: UI.spacing.xl,
+    padding: UI.spacing.lg,
+    borderRadius: UI.radius.lg,
+    borderWidth: 1,
+    borderColor: UI.colors.cardBorder,
+    backgroundColor: UI.colors.cardBg,
+  },
+  bannerTitle: { color: UI.colors.text, fontWeight: "700", marginBottom: 6 },
+  bannerText: { color: UI.colors.textDim, lineHeight: 18 },
 });

@@ -164,3 +164,124 @@ export async function clearLocalLogs(): Promise<void> {
     logs: [],
   });
 }
+
+
+// ------------------------------
+// Local Menu Drafts (Privacy mode)
+// ------------------------------
+
+export type LocalMenuDraft = {
+  placeRefId: string;
+  items: string[];          // selected item names only
+  updatedAt: string;        // ISO
+  expiresAt: string;        // ISO (now + 30 days)
+};
+
+type LocalMenuFileShape = {
+  version: 1;
+  updatedAt: string;
+  drafts: Record<string, LocalMenuDraft>; // key = placeRefId
+};
+
+const MENU_FILE_NAME = "voravia_local_menu_drafts_v1.json";
+
+function getMenuFilePath(): string {
+  const dir = FileSystem.documentDirectory;
+  const fallback = FileSystem.cacheDirectory ?? "";
+  return `${dir ?? fallback}${MENU_FILE_NAME}`;
+}
+
+async function readMenuFileJson(): Promise<LocalMenuFileShape> {
+  const path = getMenuFilePath();
+  try {
+    const info = await FileSystem.getInfoAsync(path);
+    if (!info.exists) return { version: 1, updatedAt: new Date().toISOString(), drafts: {} };
+    const raw = await FileSystem.readAsStringAsync(path);
+    if (!raw?.trim()) return { version: 1, updatedAt: new Date().toISOString(), drafts: {} };
+
+    const parsed = JSON.parse(raw) as Partial<LocalMenuFileShape>;
+    return {
+      version: 1,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+      drafts: parsed.drafts && typeof parsed.drafts === "object" ? (parsed.drafts as any) : {},
+    };
+  } catch {
+    return { version: 1, updatedAt: new Date().toISOString(), drafts: {} };
+  }
+}
+
+async function writeMenuFileJson(next: LocalMenuFileShape): Promise<void> {
+  const path = getMenuFilePath();
+  const tmp = `${path}.tmp`;
+  await FileSystem.writeAsStringAsync(tmp, JSON.stringify(next));
+  try { await FileSystem.deleteAsync(path, { idempotent: true }); } catch {}
+  await FileSystem.moveAsync({ from: tmp, to: path });
+}
+
+function dedupeNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const n of names) {
+    const clean = (n ?? "").trim();
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out;
+}
+
+export async function getLocalMenuDraft(placeRefId: string): Promise<LocalMenuDraft | null> {
+  const file = await readMenuFileJson();
+  const d = file.drafts[placeRefId];
+  if (!d) return null;
+
+  const now = Date.now();
+  const exp = Date.parse(d.expiresAt);
+  if (Number.isFinite(exp) && exp <= now) {
+    delete file.drafts[placeRefId];
+    await writeMenuFileJson({ version: 1, updatedAt: new Date().toISOString(), drafts: file.drafts });
+    return null;
+  }
+  return d;
+}
+
+export async function upsertLocalMenuDraft(
+  placeRefId: string,
+  items: string[],
+  opts?: { merge?: boolean }
+): Promise<LocalMenuDraft> {
+  const file = await readMenuFileJson();
+  const existing = file.drafts[placeRefId];
+
+  const merged = opts?.merge && existing
+    ? dedupeNames([...(existing.items ?? []), ...items])
+    : dedupeNames(items);
+
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+  const next: LocalMenuDraft = {
+    placeRefId,
+    items: merged,
+    updatedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  };
+
+  file.drafts[placeRefId] = next;
+
+  await writeMenuFileJson({
+    version: 1,
+    updatedAt: now.toISOString(),
+    drafts: file.drafts,
+  });
+
+  return next;
+}
+
+export async function clearLocalMenuDraft(placeRefId: string): Promise<void> {
+  const file = await readMenuFileJson();
+  delete file.drafts[placeRefId];
+  await writeMenuFileJson({ version: 1, updatedAt: new Date().toISOString(), drafts: file.drafts });
+}

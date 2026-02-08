@@ -30,6 +30,7 @@ import { AIPill } from "../../components/ui/ai-pill";
 import { ScoringPanel } from "../../components/ui/scoring-panel";
 import { getLocalLogs } from "../../src/storage/local-logs"; // adjust relative path
 import { useModeGate } from "../../src/hooks/use-mode-gate";
+import { normalizeReasons } from "../../src/utils/score-explain";
 
 
 
@@ -359,7 +360,7 @@ const loadAll = useCallback(
             <ScoringPanel
               scoring={{
                 score: explanation.score,
-                reasons: explanation.reasons,
+                reasons: normalizeReasons(explanation.reasons, { context: "log", max: 5 }),
                 signals: explanation.signals,
               }}
               explained={explanationSource === "per-log"}

@@ -11,3 +11,9 @@ export function openDb(dbFilePath: string): Db {
 
   return db;
 }
+
+
+// Request-scoped DB accessor
+export function getDbFromReq(req: any) {
+  return req?.app?.locals?.db ?? null;
+}

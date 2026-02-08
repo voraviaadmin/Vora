@@ -4,6 +4,8 @@ import Tesseract from "tesseract.js";
 const { createWorker, PSM } = Tesseract;
 import sharp from "sharp";
 import { requireSyncMode, apiOk, apiErr } from "../../middleware/resolveContext";
+import { getSyncPreferences } from "../restaurants/preferences";
+import { scoreFoodScanSync } from "../restaurants/scoring";
 
 // IMPORTANT: memory storage (privacy-first, no disk writes)
 const upload = multer({
@@ -226,6 +228,65 @@ syncScanRouter.post("/score", requireSyncMode(), async (req, res) => {
     );
   } catch (e: any) {
     const r = apiErr(req, "SYNC_SCORE_FAILED", "We couldn’t score this scan.", "Try again or paste the label text.", 500, true);
+    return res.status(r.status).json(r.body);
+  }
+});
+
+
+/**
+ * POST /v1/sync/scan/score
+ * Unified scoring contract v1 (Sync-only, OpenAI authoritative)
+ * Body: { context: "food_scan" | "menu_scan" | "eatout_menu", input: { text?: string, menuItems?: [...] } }
+ *
+ * NOTE: Backend must enrich with profile + goals. Frontend should not hardcode profile fields.
+ */
+syncScanRouter.post("/score-v1", requireSyncMode(), async (req, res) => {
+  try {
+    const context = String(req.body?.context ?? "").trim();
+    const input = req.body?.input ?? {};
+
+    if (!context) {
+      const r = apiErr(req, "MISSING_CONTEXT", "Missing context.", "Try again.", 400, true);
+      return res.status(r.status).json(r.body);
+    }
+
+    // Food scan (typed)
+    const text = String(input?.text ?? "").trim();
+
+    if (context === "food_scan") {
+      if (!text) {
+        const r = apiErr(req, "MISSING_TEXT", "No food text provided.", "Type what you ate and try again.", 400, true);
+        return res.status(r.status).json(r.body);
+      }
+
+      const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+      if (!apiKey) {
+        const r = apiErr(req, "MISSING_OPENAI_KEY", "Scoring not configured.", "Try later.", 500, false);
+        return res.status(r.status).json(r.body);
+      }
+      
+      const prefs = getSyncPreferences(req);
+      
+      const result = await scoreFoodScanSync({
+        apiKey,
+        modelText: String(process.env.OPENAI_TEXT_MODEL ?? "gpt-4o-mini"),
+        modelVision: String(process.env.OPENAI_VISION_MODEL ?? "gpt-4o-mini"),
+        text,
+        preferences: prefs,
+      });
+      
+      return res.json(apiOk(req, result));
+      
+      
+
+
+    }
+
+    // Unknown context
+    const r = apiErr(req, "UNSUPPORTED_CONTEXT", "Unsupported scoring context.", "Try again.", 400, true);
+    return res.status(r.status).json(r.body);
+  } catch (e: any) {
+    const r = apiErr(req, "SCORE_V1_FAILED", "Could not score.", "Try again.", 500, false);
     return res.status(r.status).json(r.body);
   }
 });

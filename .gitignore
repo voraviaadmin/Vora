@@ -1,21 +1,29 @@
-# macOS
-.DS_Store
-
+cat <<EOF > .gitignore
 # Node
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Env files
+# Env
 .env
+.env.*
+!.env.example
 
-# SQLite / local DB
-*.db
-*.db-wal
-*.db-shm
-
-# Expo
-.expo/
+# Build
 dist/
-web-build/
+build/
+.expo/
+.expo-shared/
 
-# Logs
-*.log
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# SQLite / temp
+*.db
+*.sqlite
+EOF

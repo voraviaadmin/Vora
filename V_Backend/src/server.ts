@@ -15,6 +15,9 @@ function ensureDbDir(dbFilePath: string) {
 
 async function main() {
   const env = loadEnv();
+  //console.log("[boot] env.PROFILE_SECRET present:", Boolean((env as any).PROFILE_SECRET));
+//console.log("[boot] process.env.PROFILE_SECRET present:", Boolean(process.env.PROFILE_SECRET));
+
   const dbFilePath = getDbFilePath(env);
 
   ensureDbDir(dbFilePath);

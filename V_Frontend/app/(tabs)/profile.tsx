@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -115,6 +115,36 @@ export default function ProfileTab() {
   const [prefs, setPrefs] = useState<Preferences>(defaultPrefs);
   const [cuisineInput, setCuisineInput] = useState("");
 
+  type CuisineCatalogItem = { id: string; label: string; aliases?: string[] };
+
+  const [cuisineCatalog, setCuisineCatalog] = useState<CuisineCatalogItem[]>([]);
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiJson<{ data: { cuisines: CuisineCatalogItem[] } }>("/v1/meta/cuisines");
+        if (cancelled) return;
+        setCuisineCatalog(res.data?.cuisines ?? []);
+        setCatalogLoaded(true);
+      } catch {
+        if (cancelled) return;
+        setCuisineCatalog([]);
+        setCatalogLoaded(true);
+      }
+    })();
+  
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  
+
+
+
+
+  
   // ✅ single authority for mode lives here now:
   const { mode, status, requestEnableSync, requestDisableSync } = useMode();
   const isSync = mode === "sync";
@@ -129,6 +159,8 @@ export default function ProfileTab() {
   const [showEnableConfirm, setShowEnableConfirm] = useState(false);
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [showNotes, setShowNotes] = useState(false);
+  
+
 
   const copy = useMemo(
     () => ({
@@ -147,7 +179,7 @@ export default function ProfileTab() {
       cuisineTitle: "Cuisines",
       cuisineSub: "Pick what you like. You can add more anytime.",
 
-      addCuisinePlaceholder: "Type a cuisine and press Add",
+      addCuisinePlaceholder: "American, Thai etc. Type a cuisine and press Add",
       addCuisineBtn: "Add",
       removeCuisineBtn: "Remove",
 
@@ -214,6 +246,21 @@ export default function ProfileTab() {
     []
   );
 
+  const cuisineSuggestions = useMemo(() => {
+    const q = cuisineInput.trim().toLowerCase();
+    if (!q) return [];
+  
+    const selectedLower = new Set(prefs.cuisines.map((c) => c.toLowerCase()));
+  
+    return cuisineCatalog
+      .filter((c) => (c.label || "").toLowerCase().includes(q))
+      .filter((c) => !selectedLower.has((c.label || "").toLowerCase()))
+      .slice(0, 8);
+  }, [cuisineInput, cuisineCatalog, prefs.cuisines]);
+  
+
+
+
   async function loadAll() {
     setLoading(true);
     setToast(null);
@@ -247,6 +294,35 @@ export default function ProfileTab() {
       setLoading(false);
     }
   }
+
+
+  useEffect(() => {
+    let cancelled = false;
+  
+    async function loadCuisineCatalog() {
+      try {
+        const res = await apiJson<{ data: { cuisines: CuisineCatalogItem[] } }>("/v1/meta/cuisines");
+        if (cancelled) return;
+        setCuisineCatalog(res.data.cuisines || []);
+        setCatalogLoaded(true);
+      } catch {
+        // Don’t block profile UX if catalog fails. Keep free-text flow.
+        if (cancelled) return;
+        setCuisineCatalog([]);
+        setCatalogLoaded(true);
+      }
+    }
+  
+    // load once (or whenever screen mounts)
+    loadCuisineCatalog();
+  
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  
+
+
 
   useEffect(() => {
     loadAll();
@@ -312,9 +388,9 @@ export default function ProfileTab() {
         goal: prefs.goal,
         cuisines: [...prefs.cuisines],
       };
-
+      //console.log("[profile/preferences] body=", JSON.stringify({ preferences: next }));
       await apiJson("/v1/profile/preferences", {
-        method: "POST",
+        method: "PUT",
         body: JSON.stringify({ preferences: next }),
       });
 
@@ -322,27 +398,81 @@ export default function ProfileTab() {
       setToast({ kind: "success", msg: "Saved. Your preferences are updated." });
       await loadAll();
     } catch (e: any) {
-      setToast({ kind: "error", msg: "Couldn’t save preferences. Please try again." });
-    } finally {
+      //console.error("[profile/preferences] save failed:", e?.stack ?? e);
+      //console.error("[profile/preferences] state:", { mode });
+      setToast({ kind: "error", msg: e?.message ?? "Couldn't save preferences. Please try again." });
+    }
+    
+
+    finally {
       setSaving(false);
     }
   }
 
 
-  function addCuisine() {
-    const raw = cuisineInput.trim();
+  function addCuisine(rawOverride?: string) {
+    const raw = (rawOverride ?? cuisineInput).trim();
     if (!raw) return;
+  
     if (prefs.cuisines.some((c) => c.toLowerCase() === raw.toLowerCase())) {
       setCuisineInput("");
       return;
     }
-    setPrefs((p) => ({ ...p, cuisines: [...p.cuisines, raw] }));
+  
+    const next: Preferences = {
+      health: { ...prefs.health },
+      goal: prefs.goal,
+      cuisines: [...prefs.cuisines, raw],
+    };
+  
+    setPrefs(next);
     setCuisineInput("");
+    scheduleAutosave(next);
   }
-
+  
+  
   function removeCuisine(c: string) {
-    setPrefs((p) => ({ ...p, cuisines: p.cuisines.filter((x) => x !== c) }));
+    const next: Preferences = {
+      health: { ...prefs.health },
+      goal: prefs.goal,
+      cuisines: prefs.cuisines.filter((x) => x !== c),
+    };
+    setPrefs(next);
+    scheduleAutosave(next);
   }
+  
+  
+  const autosaveTimer = useRef<any>(null);
+
+
+async function persistPreferences(next: Preferences) {
+  if (!isSync) return; // don’t write in Privacy mode
+
+  setToast(null);
+  try {
+    await apiJson("/v1/profile/preferences", {
+      method: "PUT", // if your backend is POST, change to "POST"
+      body: JSON.stringify({ preferences: next }),
+    });
+    setToast({ kind: "success", msg: "Saved." });
+  } catch {
+    setToast({ kind: "error", msg: "Couldn’t save. Please try again." });
+  }
+}
+
+function scheduleAutosave(next: Preferences) {
+  if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+  autosaveTimer.current = setTimeout(() => {
+    persistPreferences(next);
+  }, 500);
+}
+
+const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
+  { label: "Lose", value: "lose" },
+  { label: "Maintain", value: "maintain" },
+  { label: "Gain", value: "gain" },
+];
+
 
 
   return (
@@ -405,24 +535,35 @@ export default function ProfileTab() {
             </View>
           </View>
 
+
+          {/* Goal chips */}
           <View style={styles.block}>
             <Text style={styles.strong}>{copy.goalTitle}</Text>
 
-            <View style={styles.pickerWrap}>
-              <Picker
-                selectedValue={prefs.goal}
-                onValueChange={(v) => setPrefs((p) => ({ ...p, goal: v }))}
-                enabled={isSync}
-              >
-                <Picker.Item label="Lose" value="lose" />
-                <Picker.Item label="Maintain" value="maintain" />
-                <Picker.Item label="Gain" value="gain" />
-              </Picker>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: UI.spacing.textGapSm }}>
+              {goalOptions.map((g) => {
+                const on = prefs.goal === g.value;
+                return (
+                  <Pressable
+                    key={g.value}
+                    disabled={!isSync}
+                    onPress={() => setPrefs((p) => ({ ...p, goal: g.value }))}
+                    style={[
+                      styles.pillBtn,
+                      on ? styles.pillBtnOn : styles.pillBtnOff,
+                      !isSync ? styles.btnDisabled : null,
+                    ]}
+                  >
+                    <Text style={styles.pillBtnText}>{g.label}</Text>
+                  </Pressable>
+                );
+              })}
             </View>
           </View>
 
           <View style={styles.block}>
             <Text style={styles.strong}>{copy.cuisineTitle}</Text>
+
             <TextInput
               value={cuisineInput}
               onChangeText={setCuisineInput}
@@ -432,22 +573,104 @@ export default function ProfileTab() {
               editable={isSync}
               autoCorrect={false}
               autoCapitalize="none"
+              returnKeyType="done"
             />
-          </View>
 
-          <Pressable
-            style={[
-              styles.btn,
-              styles.btnPrimary,
-              (!isSync || saving) ? styles.btnDisabled : null,
-            ]}
-            onPress={savePreferences}
-            disabled={!isSync || saving}
-          >
-            {saving ? <ActivityIndicator /> : <Text style={styles.btnPrimaryText}>{copy.saveBtn}</Text>}
-          </Pressable>
+  {/* Add cuisine button (your addCuisine() was not wired before) */}
+  <Pressable
+    style={[
+      styles.btn,
+      styles.btnSecondary,
+      (!isSync || !cuisineInput.trim()) ? styles.btnDisabled : null,
+      { marginTop: 10 },
+    ]}
+    onPress={() => addCuisine()}
+    disabled={!isSync || !cuisineInput.trim()}
+  >
+    <Text style={styles.btnSecondaryText}>{copy.addCuisineBtn}</Text>
+  </Pressable>
+
+  {/* Selected cuisines chips */}
+  {prefs.cuisines.length > 0 && (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+      {prefs.cuisines.map((c) => (
+        <Pressable
+          key={c}
+          onPress={() => removeCuisine(c)}
+          disabled={!isSync}
+          style={{
+            paddingVertical: 6,
+            paddingHorizontal: 10,
+            borderRadius: 999,
+            borderWidth: 1,
+            borderColor: UI.colors.outline,
+            backgroundColor: UI.colors.surface,
+            opacity: isSync ? 1 : 0.5,
+          }}
+        >
+          <Text style={{ color: UI.colors.text, fontSize: 13 }}>{c}  ✕</Text>
+        </Pressable>
+      ))}
+    </View>
+  )}
+
+  {/* Suggestions (only when typing) */}
+  {cuisineInput.trim().length > 0 && (
+    <View style={{ marginTop: 10 }}>
+      {!catalogLoaded ? (
+        <Text style={[styles.muted, { fontSize: 12 }]}>Loading suggestions…</Text>
+      ) : cuisineSuggestions.length > 0 ? (
+        <View style={{ gap: 8 }}>
+          <Text style={[styles.muted, { fontSize: 12 }]}>Suggestions</Text>
+
+          {cuisineSuggestions.map((s) => (
+            <Pressable
+              key={s.id}
+              onPress={() => addCuisine(s.label)}
+              disabled={!isSync}
+              style={{
+                paddingVertical: 10,
+                paddingHorizontal: 12,
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: UI.colors.outline,
+                backgroundColor: UI.colors.surface,
+                opacity: isSync ? 1 : 0.5,
+              }}
+            >
+              <Text style={{ color: UI.colors.text, fontSize: 14 }}>{s.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : (
+        <Text style={[styles.muted, { fontSize: 12 }]}>
+          No suggestions. Tap “Add” to save as a custom cuisine.
+        </Text>
+      )}
+    </View>
+  )}
+          </View>
         </View>
 
+
+        {/* ✅ Save button BETWEEN Preferences and Privacy/Sync cards */}
+        <Pressable
+          style={[
+            styles.btn,
+            styles.btnPrimary,
+            (!isSync || saving) ? styles.btnDisabled : null,
+          ]}
+          onPress={savePreferences}
+          disabled={!isSync || saving}
+        >
+          {saving ? <ActivityIndicator /> : <Text style={styles.btnPrimaryText}>{copy.saveBtn}</Text>}
+        </Pressable>
+
+
+
+
+
+{/* Privacy & Sync */}
 
         <View style={styles.card}>
           <View style={styles.rowBetween}>

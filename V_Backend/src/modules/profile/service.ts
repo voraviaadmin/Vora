@@ -23,6 +23,78 @@ function isSyncEnabled(settings: any): boolean {
 }
 
 
+function normalizeCuisine(s: string): string {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9\s\-]/g, "");
+}
+
+
+function buildCuisineLookup(db: any) {
+  const rows = db
+    .prepare(
+      `
+      SELECT id, label, aliasesJson
+      FROM cuisine_catalog
+      WHERE active=1
+    `
+    )
+    .all() as Array<{ id: string; label: string; aliasesJson: string | null }>;
+
+  const idByNorm = new Map<string, string>();
+  const labelByNorm = new Map<string, string>();
+  const aliasByNorm = new Map<string, string>();
+
+  for (const r of rows) {
+    idByNorm.set(normalizeCuisine(r.id), r.id);
+    labelByNorm.set(normalizeCuisine(r.label), r.id);
+
+    if (r.aliasesJson) {
+      try {
+        const arr = JSON.parse(r.aliasesJson);
+        if (Array.isArray(arr)) {
+          for (const a of arr) aliasByNorm.set(normalizeCuisine(String(a)), r.id);
+        }
+      } catch {
+        // ignore bad aliasesJson
+      }
+    }
+  }
+
+  return { idByNorm, labelByNorm, aliasByNorm };
+}
+
+function deriveCuisineIdsAndCustoms(
+  cuisines: string[],
+  lookup: ReturnType<typeof buildCuisineLookup>
+) {
+  const ids = new Set<string>();
+  const customs: string[] = [];
+
+  for (const raw of cuisines) {
+    const n = normalizeCuisine(raw);
+    const hit =
+      lookup.idByNorm.get(n) ||
+      lookup.labelByNorm.get(n) ||
+      lookup.aliasByNorm.get(n) ||
+      null;
+
+    if (hit) ids.add(hit);
+    else customs.push(raw);
+  }
+
+  return { cuisineIds: Array.from(ids), customCuisines: customs };
+}
+
+
+
+
+
+
+
+
 function assertPreferencesShape(prefs: any) {
   if (!prefs || typeof prefs !== "object") throw new Error("BAD_PREFERENCES");
 
@@ -46,12 +118,30 @@ function assertPreferencesShape(prefs: any) {
     .filter(Boolean)
     .slice(0, 25);
 
+  // Optional fields (frontend can ignore them; backend can store them)
+  const cuisineIds = Array.isArray(prefs.cuisineIds)
+    ? prefs.cuisineIds
+        .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 50)
+    : undefined;
+
+  const customCuisines = Array.isArray(prefs.customCuisines)
+    ? prefs.customCuisines
+        .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 50)
+    : undefined;
+
   return {
     health: { diabetes, highBP, fattyLiver },
     goal,
     cuisines: cleanedCuisines,
+    cuisineIds,
+    customCuisines,
   };
 }
+
 
 
 
@@ -220,7 +310,62 @@ export function saveProfilePreferences(req: Request, body: any) {
   const incoming = body?.preferences ?? body;
   const prefs = assertPreferencesShape(incoming);
 
-  const encrypted = encryptProfile(prefs);
+  // ✅ Derive cuisineIds/customCuisines deterministically (no OpenAI)
+  // Requires cuisine_catalog table (seeded via migration).
+  const rows = db
+    .prepare(
+      `
+      SELECT id, label, aliasesJson
+      FROM cuisine_catalog
+      WHERE active=1
+    `
+    )
+    .all() as Array<{ id: string; label: string; aliasesJson: string | null }>;
+
+  const idByNorm = new Map<string, string>();
+  const labelByNorm = new Map<string, string>();
+  const aliasByNorm = new Map<string, string>();
+
+  for (const r of rows) {
+    idByNorm.set(normalizeCuisine(r.id), r.id);
+    labelByNorm.set(normalizeCuisine(r.label), r.id);
+    if (r.aliasesJson) {
+      try {
+        const arr = JSON.parse(r.aliasesJson);
+        if (Array.isArray(arr)) {
+          for (const a of arr) aliasByNorm.set(normalizeCuisine(String(a)), r.id);
+        }
+      } catch {
+        // ignore bad aliasesJson
+      }
+    }
+  }
+
+  const derivedCuisineIds = new Set<string>();
+  const derivedCustoms: string[] = [];
+
+  for (const raw of prefs.cuisines) {
+    const n = normalizeCuisine(raw);
+    const hit =
+      idByNorm.get(n) ||
+      labelByNorm.get(n) ||
+      aliasByNorm.get(n) ||
+      null;
+
+    if (hit) derivedCuisineIds.add(hit);
+    else derivedCustoms.push(raw);
+  }
+
+  const enrichedPrefs = {
+    health: prefs.health,
+    goal: prefs.goal,
+    cuisines: prefs.cuisines, // keep UI display list as-is
+    cuisineIds: derivedCuisineIds,
+  customCuisines: derivedCustoms,
+  };
+
+
+  const encrypted = encryptProfile(enrichedPrefs);
 
   db.prepare(`
     INSERT INTO user_profile_preferences_secure (userId, encryptedJson, updatedAt)

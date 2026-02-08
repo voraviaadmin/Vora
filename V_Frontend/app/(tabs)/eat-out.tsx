@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Alert, StyleSheet, Text, View, ScrollView } from "react-native";
-import { useRouter } from "expo-router";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Alert, StyleSheet, Text, View, ScrollView, TextInput, Pressable } from "react-native";
+import { useFocusEffect, useRouter } from "expo-router";
 
 import { UI } from "../../src/theme/ui";
 import { Card } from "../../components/ui/card";
@@ -8,24 +8,24 @@ import { Button } from "../../components/ui/button";
 import { useModeGate } from "../../src/hooks/use-mode-gate";
 
 import { syncEatOutSnapshotStatus, syncEatOutGetSnapshot, type MenuSnapshot } from "../../src/api/meal-scoring";
+import { getLocalMenuDraft } from "../../src/storage/local-logs";
+import * as Location from "expo-location";
+import { syncEatOutRestaurantsNearby } from "../../src/api/meal-scoring";
+import { apiJson } from "../../src/api/client";
+
+
 
 type EatOutTab = "restaurants";
 
 type Restaurant = {
   placeRefId: string;
   name: string;
-  cuisine: string;
-  miles: number;
-  rating?: number;
+  addressShort?: string | null;
+  rating?: number | null;
+  priceLevel?: number | null;
+  primaryType?: string | null;
 };
 
-const DEFAULT_RESTAURANTS: Restaurant[] = [
-  { placeRefId: "test-place-1", name: "Monk’s Kitchen", cuisine: "Indian", miles: 1.2, rating: 4.4 },
-  { placeRefId: "test-place-2", name: "Seoul Garden", cuisine: "Korean", miles: 3.1, rating: 4.6 },
-  { placeRefId: "test-place-3", name: "El Toro", cuisine: "Mexican", miles: 2.8, rating: 4.5 },
-];
-
-const CUISINES = ["Indian", "Thai", "Mexican", "Chinese", "Japanese", "Mediterranean", "American", "Korean"];
 
 export default function EatOutTabScreen() {
   const router = useRouter();
@@ -33,8 +33,15 @@ export default function EatOutTabScreen() {
   const isSync = mode === "sync";
 
   const [tab] = useState<EatOutTab>("restaurants");
-  const [selectedCuisines, setSelectedCuisines] = useState<string[]>(["Indian", "Thai", "Mexican"]); // session-only default
-  const [restaurants] = useState<Restaurant[]>(DEFAULT_RESTAURANTS);
+
+  const [selectedCuisines, setSelectedCuisines] = useState<string[]>([]);
+  const [seededFromProfile, setSeededFromProfile] = useState(false);
+
+  
+  const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(true);
+
 
   const [statusMap, setStatusMap] = useState<Record<string, { hasSnapshot: boolean; updatedAt?: string | null; expiresAt?: string | null }>>({});
   const [loadingStatus, setLoadingStatus] = useState(false);
@@ -42,12 +49,30 @@ export default function EatOutTabScreen() {
   const [viewing, setViewing] = useState<{ placeRefId: string; name: string } | null>(null);
   const [snapshot, setSnapshot] = useState<MenuSnapshot | null>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState(false);
+  const [localMenuMap, setLocalMenuMap] = useState<Record<string, boolean>>({});
+  const [cuisineInput, setCuisineInput] = useState("");
+  const [expandedPlaceRefId, setExpandedPlaceRefId] = useState<string | null>(null);
 
-  const filtered = useMemo(() => {
+
+  type CuisineCatalogItem = { id: string; label: string; aliases: string[] };
+  type CuisinesApiResponse = { items?: Array<{ id?: unknown; label?: unknown; aliasesJson?: string }> };
+
+const [cuisineCatalog, setCuisineCatalog] = useState<CuisineCatalogItem[]>([]);
+const [catalogLoaded, setCatalogLoaded] = useState(false);
+const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[]>([]);
+
+
+
+
+
+  /*const filtered = useMemo(() => {
     // session-only filter; user can choose only Korean, etc.
     if (!selectedCuisines.length) return [];
     return restaurants.filter((r) => selectedCuisines.includes(r.cuisine));
-  }, [restaurants, selectedCuisines]);
+  }, [restaurants, selectedCuisines]);*/
+
+  const visible = useMemo(() => restaurants, [restaurants]);
+
 
   const copy = useMemo(() => {
     return {
@@ -58,12 +83,88 @@ export default function EatOutTabScreen() {
       hint: "Profile preferences seed this list — changes here won’t update Profile.",
     };
   }, [isSync]);
+  
+  function normalizeCuisine(s: string) {
+    return s.trim().replace(/\s+/g, " ");
+  }
+  
+  
+  function removeCuisine(name: string) {
+    setSelectedCuisines((prev) => prev.filter((c) => c !== name));
+  }
+  
+
+  async function seedCuisinesFromProfileOnce() {
+    if (!isSync) return;
+    if (seededFromProfile) return;
+  
+    try {
+      const resp = await apiJson<{ preferences?: { cuisines?: string[] } }>(
+        "/v1/profile/preferences",
+        { method: "GET" },
+        { feature: "eatout.seed", operation: "profile.preferences.get" }
+      );
+  
+      const fromProfile = resp?.preferences?.cuisines ?? [];
+      setSelectedCuisines(fromProfile);
+      setSeededFromProfile(true);
+    } catch {
+      // zero-patience: don't block screen; user can still type/add cuisines manually
+      setSeededFromProfile(true);
+    }
+  }
+  
+  useFocusEffect(
+    useCallback(() => {
+      seedCuisinesFromProfileOnce();
+    }, [isSync, seededFromProfile])
+  );
+  
+
+
+  async function runSearch() {
+    if (!isSync) {
+      Alert.alert("Enable Sync", "Restaurant discovery uses backend services. Enable Sync in Profile.");
+      return;
+    }
+  
+    if (!selectedCuisines.length) {
+      Alert.alert("Select cuisines", "Pick at least one cuisine to search nearby.");
+      return;
+    }
+  
+    setSearching(true);
+    try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (perm.status !== "granted") {
+        Alert.alert("Location needed", "Enable location to find nearby restaurants.");
+        return;
+      }
+  
+      const loc = await Location.getCurrentPositionAsync({});
+      const lat = loc.coords.latitude;
+      const lng = loc.coords.longitude;
+  
+      const resp = await syncEatOutRestaurantsNearby(
+        { lat, lng, cuisines: selectedCuisines },
+        { mode }
+      );
+  
+      setRestaurants(resp.data.results);
+      setFiltersOpen(false);
+    } catch (e: any) {
+      Alert.alert("Search failed", e?.message ?? "Try again.");
+    } finally {
+      setSearching(false);
+    }
+  }
+  
 
   useEffect(() => {
     // Load snapshot status for visible restaurants (Sync only)
     async function load() {
       if (!isSync) return;
-      const ids = filtered.map((r) => r.placeRefId);
+      const ids = visible.map((r) => r.placeRefId);
       if (!ids.length) return;
 
       setLoadingStatus(true);
@@ -82,7 +183,98 @@ export default function EatOutTabScreen() {
     }
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSync, mode, filtered.map((r) => r.placeRefId).join(",")]);
+  }, [isSync, mode, visible.map((r) => r.placeRefId).join(",")]);
+
+
+  useEffect(() => {
+  let mounted = true;
+  (async () => {
+    if (!isSync) return;
+
+    try {
+      const [catalogRes, prefsRes] = await Promise.all([
+        apiJson<CuisinesApiResponse>(`/v1/meta/cuisines`, { method: "GET" }),
+        apiJson<{ cuisines?: unknown[] }>(`/v1/profile/preferences`, { method: "GET" }),
+      ]);
+
+      if (!mounted) return;
+
+      const catalog: CuisineCatalogItem[] = (catalogRes.items ?? []).map((r: any) => ({
+        id: String(r.id),
+        label: String(r.label),
+        aliases: (() => {
+          try { return JSON.parse(r.aliasesJson ?? "[]"); } catch { return []; }
+        })(),
+      }));
+
+      setCuisineCatalog(catalog);
+      setCatalogLoaded(true);
+
+      const seeded = Array.isArray(prefsRes?.cuisines) ? prefsRes.cuisines.map(String) : [];
+      setSelectedCuisines(seeded);
+    } catch {
+      if (!mounted) return;
+      setCatalogLoaded(true);
+    }
+  })();
+
+  return () => { mounted = false; };
+}, [isSync]);
+
+
+useEffect(() => {
+  const q = cuisineInput.trim().toLowerCase();
+  if (!q) { setCuisineSuggestions([]); return; }
+  if (!catalogLoaded) { setCuisineSuggestions([]); return; }
+
+  const matches = cuisineCatalog.filter((c) => {
+    const label = c.label.toLowerCase();
+    const aliasHit = c.aliases.some((a) => a.toLowerCase().includes(q));
+    return label.includes(q) || aliasHit;
+  });
+
+  setCuisineSuggestions(matches.slice(0, 8));
+}, [cuisineInput, cuisineCatalog, catalogLoaded]);
+
+
+
+function canonicalizeCuisine(input: string) {
+  const raw = input.trim();
+  if (!raw) return "";
+
+  const q = raw.toLowerCase();
+  const exact = cuisineCatalog.find(c => c.label.toLowerCase() === q);
+  if (exact) return exact.label;
+
+  // alias exact
+  const aliasExact = cuisineCatalog.find(c => c.aliases.some(a => a.toLowerCase() === q));
+  if (aliasExact) return aliasExact.label;
+
+  // fuzzy: "korea" should match "Korean"
+  const starts = cuisineCatalog.find(c => c.label.toLowerCase().startsWith(q));
+  if (starts) return starts.label;
+
+  const aliasStarts = cuisineCatalog.find(c => c.aliases.some(a => a.toLowerCase().includes(q)));
+  if (aliasStarts) return aliasStarts.label;
+
+  // fallback: allow custom cuisine
+  return raw;
+}
+
+function addCuisine(label: string) {
+  const canon = canonicalizeCuisine(label);
+  if (!canon) return;
+
+  setSelectedCuisines((prev) => {
+    if (prev.some(p => p.toLowerCase() === canon.toLowerCase())) return prev;
+    return [...prev, canon];
+  });
+  setCuisineInput("");
+  setCuisineSuggestions([]);
+}
+
+
+
 
   function toggleCuisine(c: string) {
     setSnapshot(null);
@@ -96,7 +288,15 @@ export default function EatOutTabScreen() {
       return;
     }
     // Pass restaurant context so Menu Scan can save snapshot for View.
-    router.push(`/scan/menu-scan?returnTo=eatout&placeRefId=${encodeURIComponent(placeRefId)}&restaurantName=${encodeURIComponent(name)}`);
+    //router.push(`/scan/menu-scan?returnTo=eatout&placeRefId=${encodeURIComponent(placeRefId)}&restaurantName=${encodeURIComponent(name)}`);
+    router.push({
+      pathname: "/scan/menu-scan",
+      params: {
+        returnTo: "/(tabs)/eat-out",
+        placeRefId: placeRefId,
+        restaurantName: name,
+      },
+    });
   }
 
   async function onView(placeRefId: string, name: string) {
@@ -119,6 +319,35 @@ export default function EatOutTabScreen() {
     }
   }
 
+  useFocusEffect(
+    React.useCallback(() => {
+      let cancelled = false;
+  
+      (async () => {
+        const next: Record<string, boolean> = {};
+        for (const r of restaurants) {
+          const draft = await getLocalMenuDraft(r.placeRefId);
+          next[r.placeRefId] = !!draft?.items?.length;
+        }
+        if (!cancelled) setLocalMenuMap(next);
+      })();
+  
+      return () => {
+        cancelled = true;
+      };
+    }, [restaurants])
+  );
+  
+
+
+
+
+
+
+
+
+
+
   function onComingSoon() {
     Alert.alert("Menu (Coming Soon)", "Phase 2: connect to Google Menu / Toast / Uber and score automatically.");
   }
@@ -131,35 +360,80 @@ export default function EatOutTabScreen() {
       <Text style={styles.sub}>{copy.sub}</Text>
 
       <Card style={styles.card}>
-        <Text style={styles.cardTitle}>Cuisines (this search only)</Text>
-        <Text style={styles.cardSub}>{copy.hint}</Text>
+  <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+    <Text style={styles.cardTitle}>Cuisines</Text>
+    <Text
+      onPress={() => setFiltersOpen((v) => !v)}
+      style={{ color: UI.colors.textDim, fontWeight: "800" }}
+    >
+      {filtersOpen ? "Hide" : "Show"}
+    </Text>
+  </View>
 
-        <View style={styles.chips}>
-          {CUISINES.map((c) => {
-            const active = selectedCuisines.includes(c);
-            return (
-              <Text
-                key={c}
-                onPress={() => toggleCuisine(c)}
-                style={[
-                  styles.chip,
-                  {
-                    borderColor: active ? apricot : UI.colors.outline,
-                    color: active ? UI.colors.text : UI.colors.textDim,
-                    backgroundColor: active ? UI.colors.surface : "transparent",
-                  },
-                ]}
-              >
-                {c}
-              </Text>
-            );
-          })}
+  {filtersOpen ? (
+    <>
+      <Text style={styles.cardSub}>{copy.hint}</Text>
+
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: UI.spacing.sm, marginTop: UI.spacing.sm }}>
+  {selectedCuisines.map((c) => (
+    <Pressable
+      key={c}
+      onPress={() => removeCuisine(c)}
+      style={styles.chip}
+    >
+      <Text style={styles.chipText}>{c}  ×</Text>
+    </Pressable>
+  ))}
+</View>
+
+      <View style={{ marginTop: UI.spacing.md }}>
+        <Text style={styles.cardTitle}>Add a cuisine</Text>
+        <View style={{ flexDirection: "row", gap: UI.spacing.sm, marginTop: UI.spacing.xs }}>
+          <TextInput
+            value={cuisineInput}
+            onChangeText={setCuisineInput}
+            placeholder="e.g., American, Thai, Italian"
+            placeholderTextColor={UI.colors.textMuted}
+            style={styles.input}
+            returnKeyType="done"
+            onSubmitEditing={() => addCuisine(cuisineInput)}
+          />
+          <Button title="Add" onPress={() => addCuisine(cuisineInput)} disabled={!normalizeCuisine(cuisineInput)} />
         </View>
+        
+      </View>
 
-        {!selectedCuisines.length ? (
-          <Text style={{ marginTop: 10, color: UI.colors.textDim }}>Select at least one cuisine to search.</Text>
-        ) : null}
-      </Card>
+
+      <View style={{ flexDirection: "row", gap: UI.spacing.md, marginTop: UI.spacing.md }}>
+        <Button
+          title="Clear all"
+          variant="ghost"
+          onPress={() => setSelectedCuisines([])}
+          style={{ flex: 1, borderWidth: 1, borderColor: UI.colors.outline }}
+        />
+        <Button
+          title={searching ? "Searching…" : "Search nearby"}
+          onPress={runSearch}
+          disabled={searching || !selectedCuisines.length}
+          style={{ flex: 1 }}
+        />
+      </View>
+    </>
+  ) : (
+    <View style={{ marginTop: 8 }}>
+      <Text style={{ color: UI.colors.textDim }}>
+        {selectedCuisines.length ? selectedCuisines.join(" · ") : "No cuisines selected"}
+      </Text>
+      <Button
+        title={searching ? "Searching…" : "Search nearby"}
+        onPress={runSearch}
+        disabled={searching || !selectedCuisines.length}
+        style={{ marginTop: UI.spacing.md }}
+      />
+    </View>
+  )}
+</Card>
+
 
       <Card style={styles.card}>
         <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
@@ -167,53 +441,66 @@ export default function EatOutTabScreen() {
           {loadingStatus ? <Text style={{ color: UI.colors.textDim, fontSize: 12 }}>Checking saved menus…</Text> : null}
         </View>
 
-        {!filtered.length ? (
+        {!visible.length ? (
           <Text style={{ marginTop: 10, color: UI.colors.textDim }}>No matches for selected cuisines.</Text>
         ) : null}
 
-        {filtered.map((r) => {
+        {visible.map((r) => {
           const st = statusMap[r.placeRefId];
           const hasSnapshot = !!st?.hasSnapshot;
+          const hasLocal = !!localMenuMap[r.placeRefId];
+          const isExpanded = expandedPlaceRefId === r.placeRefId;
+
+
 
           return (
             <View key={r.placeRefId} style={styles.restRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.restName}>{r.name}</Text>
-                <Text style={styles.restMeta}>
-                  {r.cuisine} · {r.miles.toFixed(1)} mi{typeof r.rating === "number" ? ` · ★ ${r.rating.toFixed(1)}` : ""}
-                </Text>
-              </View>
+            <Pressable
+              onPress={() => setExpandedPlaceRefId((cur) => (cur === r.placeRefId ? null : r.placeRefId))}
+              style={{ flex: 1 }}
+            >
+              <Text style={styles.restName}>{r.name}</Text>
+        
+              <Text style={styles.restMeta}>
+                {(r.primaryType ?? "restaurant").replace(/_/g, " ")}
+                {typeof r.rating === "number" ? ` · ★ ${r.rating.toFixed(1)}` : ""}
+                {r.addressShort ? ` · ${r.addressShort}` : ""}
+              </Text>
+            </Pressable>
 
-              <View style={styles.restBtns}>
-                
-                <Button
-                  title={hasSnapshot ? "Rescan" : "Scan menu"}
-                  onPress={() =>
-                    router.push(
-                      `/scan/menu-scan?placeRefId=${r.placeRefId}&restaurantName=${encodeURIComponent(
-                        r.name
-                      )}`
-                    )
-                  }
-                />
-
-                {hasSnapshot && (
+            {isExpanded && (
+                  <View style={styles.restBtns}>
                   <Button
-                    title="View menu (Scored)"
-                    variant="ghost"
+                    title={hasSnapshot ? "Rescan menu" : "Scan menu"}
                     onPress={() =>
-                      router.push(
-                        `/eatout/menu-view?placeRefId=${r.placeRefId}&restaurantName=${encodeURIComponent(
-                          r.name
-                        )}`
-                      )
+                      router.push({
+                        pathname: "/scan/menu-scan",
+                        params: {
+                          placeRefId: r.placeRefId,
+                          restaurantName: r.name,
+                          returnTo: "/(tabs)/eat-out",
+                        },
+                      })
                     }
                   />
-                )}
 
-                <Button title="Menu (Coming Soon)" disabled />
+                    {(hasSnapshot || hasLocal) && (
+                      <Button
+                        title={hasSnapshot ? "View menu (Scored)" : "View menu"}
+                        
+                        onPress={() =>
+                          router.push({
+                            pathname: "/eatout/menu-view",
+                            params: { placeRefId: r.placeRefId, restaurantName: r.name },
+                          })
+                        }
+                      />
+                    )}
 
-              </View>
+                    <Button title="Menu (Coming Soon)" disabled />
+
+                  </View>
+            )}
 
               {hasSnapshot && st?.expiresAt ? (
                 <Text style={{ marginTop: 6, color: UI.colors.textDim, fontSize: 12 }}>
@@ -291,14 +578,26 @@ const styles = StyleSheet.create({
   },
   cardTitle: { color: UI.colors.text, fontWeight: "900", fontSize: 16 },
   cardSub: { color: UI.colors.textDim, marginTop: 4 },
+  input: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: UI.radius.md,
+    borderWidth: 1,
+    borderColor: UI.colors.outline,
+    backgroundColor: UI.colors.surface2,
+    color: UI.colors.text,
+    fontSize: 16,
+  },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: 12 },
   chip: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 999,
     borderWidth: 1,
-    fontWeight: "800",
+    borderColor: UI.colors.primary.teal,
+    paddingHorizontal: UI.spacing.md,
+    paddingVertical: UI.spacing.sm,
+    borderRadius: 999,
   },
+  chipText: { color: UI.colors.text, fontWeight: "600", fontSize: 14 },
   restRow: {
     marginTop: UI.spacing.md,
     paddingTop: UI.spacing.md,

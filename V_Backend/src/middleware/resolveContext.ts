@@ -139,8 +139,21 @@ const persistedActive =
     .prepare("SELECT mode FROM profile_settings WHERE userId=?")
     .get(userId) as { mode?: string } | undefined;
   
-  const profileMode: "privacy" | "sync" = settings?.mode === "sync" ? "sync" : "privacy";
+  // ✅ Allow header override (useful for dev/testing + explicit callers)
+  // Production-safe default: only allow header override when not production.
+  const headerMode = String(req.header("x-vora-mode") || "").trim().toLowerCase();
+  const allowHeaderOverride = process.env.NODE_ENV !== "production";
+  
+  const resolvedMode =
+    allowHeaderOverride && headerMode === "sync"
+      ? "sync"
+      : settings?.mode === "sync"
+        ? "sync"
+        : "privacy";
+  
+  const profileMode: "privacy" | "sync" = resolvedMode;
   const syncEnabled = profileMode === "sync";
+  
 
 
 
@@ -163,6 +176,12 @@ req.ctx = {
   profileMode,
 syncEnabled,
 };
+
+
+
+//console.log("[ctx]", {  userId,  mode: profileMode,  path: req.path,});
+
+
 
 next();
 

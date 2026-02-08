@@ -1,1 +1,2 @@
-export { default } from "../../src/screens/scan/menu-scan";
+import MenuScanScreen from "../../src/screens/scan/menu-scan";
+export default MenuScanScreen;

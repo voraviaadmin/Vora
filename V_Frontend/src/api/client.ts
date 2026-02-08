@@ -57,6 +57,12 @@ type ApiErrorDetails = {
   bodyText?: string;
 };
 
+type ApiMeta = {
+  feature?: string;     // e.g. "eatout.nearby_search"
+  operation?: string;   // e.g. "places.nearby" | "openai.score" | "snapshot.upsert"
+};
+
+
 export class ApiError extends Error implements ApiErrorDetails {
   status: number;
   url: string;
@@ -125,7 +131,9 @@ function makeRequestId() {
 function mergeHeaders(
   optsHeaders: HeadersInit | undefined,
   opts: RequestInit | undefined,
-  snap: { mode: "privacy" | "sync"; lastChangedAt: number }
+  snap: { mode: "privacy" | "sync"; lastChangedAt: number },
+  path: string,
+  meta?: ApiMeta
 ): Record<string, string> {
   const incoming = toRecord(optsHeaders);
 
@@ -137,6 +145,10 @@ function mergeHeaders(
     "x-vora-mode": snap.mode,
     "x-vora-mode-changed-at": String(snap.lastChangedAt),
     "x-vora-request-id": makeRequestId(),
+    // ✅ cost attribution
+    "x-vora-feature": meta?.feature || `api:${normalizePath(path)}`,
+    ...(meta?.operation ? { "x-vora-operation": meta.operation } : {}),
+
 
     ...incoming,
   };
@@ -172,7 +184,7 @@ async function handleJson<T>(res: Response, url: string, path: string): Promise<
 }
 
 /** Canonical API helper (JSON in/out) */
-export async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<T> {
+export async function apiJson<T>(path: string, opts: RequestInit = {}, meta?: ApiMeta): Promise<T> {
   const snap = await waitForModeReady();
   const method = (opts.method ?? "GET").toUpperCase();
 
@@ -181,7 +193,7 @@ export async function apiJson<T>(path: string, opts: RequestInit = {}): Promise<
   }
 
   const url = buildUrl(path);
-  const headers = mergeHeaders(opts.headers, opts, snap);
+  const headers = mergeHeaders(opts.headers, opts, snap, path, meta);
 
   const controller = new AbortController();
   const timeoutMs = 15000;

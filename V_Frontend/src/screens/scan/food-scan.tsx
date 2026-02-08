@@ -1,54 +1,112 @@
 // app/scan/food-scan.tsx
-import React, { useMemo, useState, useRef } from "react";
+import React, { useMemo, useState, useRef, useEffect } from "react";
 import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
+  type ViewStyle,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
-
+import { useLocalSearchParams } from "expo-router";
 import { UI } from "../../theme/ui";
 import { useModeGate } from "../../hooks/use-mode-gate";
-import { createMealLog, scoreMealInputPreview, type MealInput, scanOcr } from "../../api/meal-scoring";
+import { createMealLog, scoreMealInputPreview, scanOcr } from "../../api/meal-scoring";
+import type { MealInput } from "../../contracts/meal-input";
 import { invalidateHomeSummary } from "../../hooks/use-home-summary";
 import { addLocalLog } from "../../storage/local-logs";
+import { normalizeReasons } from "../../utils/score-explain";
+import { scoreV1 } from "../../api/meal-scoring";
+
+
+
 
 
 type Preview = { scoring?: any };
+
+type MealType = "breakfast" | "lunch" | "dinner" | "snack";
+type StartMode = "camera" | "text";
+
+function coerceMealType(v: unknown): MealType | null {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "breakfast" || s === "lunch" || s === "dinner" || s === "snack") return s;
+  return null;
+}
+
+function coerceStart(v: unknown): StartMode {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "text" ? "text" : "camera";
+}
+
 
 function PrimaryButton(props: {
   title: string;
   onPress: () => void;
   disabled?: boolean;
   tone?: "primary" | "secondary";
+  style?: ViewStyle;
 }) {
-  const { title, onPress, disabled, tone = "primary" } = props;
+  const { title, onPress, disabled, tone = "primary", style } = props;
 
   return (
-    <View style={{ flexGrow: 0 }}>
-      <Text
+    <View style={[style]}>
+      <Pressable
         onPress={disabled ? undefined : onPress}
+        disabled={disabled}
         style={[
           styles.btn,
           tone === "secondary" ? styles.btnSecondary : styles.btnPrimary,
           disabled ? styles.btnDisabled : null,
         ]}
       >
-        {title}
-      </Text>
+        <Text style={styles.btnText}>{title}</Text>
+      </Pressable>
     </View>
   );
 }
 
 export default function FoodScanScreen() {
+  const params = useLocalSearchParams<{ mealType?: string; start?: string }>();
+  const start = coerceStart(params.start);
+  const inputRef = useRef<TextInput>(null);
+  const [cameraExpanded, setCameraExpanded] = useState(start === "camera");
+  const [textExpanded, setTextExpanded] = useState(start === "text");
+
+
+
+  useEffect(() => {
+    if (start === "text") {
+      setTextExpanded(true);
+      setCameraExpanded(false);
+    } else {
+      setCameraExpanded(true);
+      setTextExpanded(false);
+    }
+  }, [start]);
+  
+  
+  useEffect(() => {
+    if (start === "text") {
+      const t = setTimeout(() => inputRef.current?.focus(), 150);
+      return () => clearTimeout(t);
+    }
+  }, [start]);
+  
+
+
+
+
+  const mealTypeOverride = coerceMealType(params.mealType);
+
   const { mode, ready } = useModeGate();
   const [permission, requestPermission] = useCameraPermissions();
+
 
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -59,6 +117,9 @@ const [scanning, setScanning] = useState(false);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [inlineError, setInlineError] = useState<string | null>(null);
+
+  
+
 
   const privacyCopy = useMemo(() => {
     if (!ready) return "";
@@ -139,37 +200,30 @@ if (ocrResp?.meta?.blocked) {
   }
 
   async function onPreview() {
-    const text = itemsText.trim();
-    if (text.length < 2) {
-      setInlineError("Type what you ate (even 1–2 words is fine), then tap Preview.");
+    const text = String(itemsText ?? "").trim();
+    if (!text) {
+      setInlineError("Type what you ate.");
       return;
     }
-
+  
     setInlineError(null);
     setPreview(null);
     setPreviewLoading(true);
-
+  
     try {
-      const input: MealInput = {
-        capturedAt: new Date().toISOString(),
-        source: "food_scan",
-        itemsText: text,
-      };
-
-      const res = await scoreMealInputPreview(input, { mode });
-
-
-
-
-
-
-      setPreview(res as any);
+      const res = await scoreV1(
+        { context: "food_scan", input: { text } },
+        { mode }
+      );
+  
+      setPreview(res.data);
     } catch (e: any) {
-      setInlineError(e?.message ?? "Couldn’t preview right now.");
+      setInlineError(e?.message ?? "Couldn't preview right now.");
     } finally {
       setPreviewLoading(false);
     }
   }
+  
 
   async function onSave() {
     const text = itemsText.trim();
@@ -187,7 +241,9 @@ if (ocrResp?.meta?.blocked) {
     setInlineError(null);
   
     try {
-      const mealType = preview?.scoring?.derived?.mealType ?? null;
+      const derivedMealType = preview?.scoring?.derived?.mealType ?? null;
+      const mealType = mealTypeOverride ?? derivedMealType ?? null;
+
   
       if (mode === "privacy") {
         // 🔐 LOCAL SAVE
@@ -214,7 +270,7 @@ if (ocrResp?.meta?.blocked) {
         invalidateHomeSummary();
         Alert.alert("Saved", `Log saved (${out.logId}).`);
       } else {
-        setInlineError(out.reason ?? "Save failed.");
+        setInlineError((out as any).reason ?? "Save failed.");
       }
     } catch (e: any) {
       setInlineError(e?.message ?? "Failed to save.");
@@ -239,8 +295,26 @@ if (ocrResp?.meta?.blocked) {
           <Text style={styles.subTitle}>{privacyCopy}</Text>
         </View>
 
+
         <View style={styles.card}>
-          <View style={styles.cameraWrap}>
+          
+  {/* Header row */}
+  <Pressable
+
+    onPress={() => setCameraExpanded((v) => !v)}
+    style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+      paddingVertical: 6,}}
+  >
+    <Text style={styles.sectionTitle}>Camera</Text>
+    <Text style={styles.toggleText}>
+      {cameraExpanded ? "Hide" : "Use camera"}
+    </Text>
+  </Pressable>
+
+  {/* Collapsible body */}
+  {cameraExpanded && (
+    <>
+        <View style={styles.cameraWrap}>
             {permission?.granted ? (
               <CameraView ref={cameraRef} style={styles.camera} />
             ) : (
@@ -250,60 +324,100 @@ if (ocrResp?.meta?.blocked) {
             )}
           </View>
 
-          <View style={styles.row}>
-            <PrimaryButton
-              title={scanning ? "Scanning..." : "Scan photo (Camera)"}
-              onPress={onScanPhoto}
-              disabled={scanning || busy || saving}
-              tone="secondary"
-            />
-            <PrimaryButton title={previewLoading ? "Previewing…" : "Preview score"} onPress={onPreview} disabled={busy || saving || previewLoading} />
-            <PrimaryButton title={saving ? "Saving…" : "Save log"} onPress={onSave} disabled={busy || saving || !preview?.scoring} tone="secondary" />
-          </View>
+      <View style={styles.row}>
+        <PrimaryButton
+          title={scanning ? "Scanning..." : "Scan photo (Camera)"}
+          onPress={onScanPhoto}
+          disabled={scanning || busy || saving}
+          tone="secondary"
+        />
+      </View>
 
-          <Text style={styles.tip}>{tipsCopy}</Text>
-        </View>
+      <Text style={styles.tip}>{tipsCopy}</Text>
+    </>
+  )}
+</View>
 
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>What did you eat?</Text>
-          <TextInput
-            style={styles.input}
-            placeholder='Example: "gatorade" or "chicken salad"'
-            placeholderTextColor={UI.colors.textMuted}
-            multiline
-            value={itemsText}
-            onChangeText={(t) => {
-              setItemsText(t);
-              setInlineError(null);
-              setPreview(null);
-            }}
-            textAlignVertical="top"
-          />
+                <Pressable
+            onPress={() => setTextExpanded((v) => !v)}
+            style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+              paddingVertical: 6,}}
+          >
+            <Text style={styles.sectionTitle}>Type</Text>
+            <Text style={styles.toggleText}>
+              {textExpanded ? "Hide" : "Type instead"}
+            </Text>
+          </Pressable>
 
-          <View style={styles.rowSmall}>
-            <PrimaryButton
-              title="Clear"
-              onPress={() => {
-                setItemsText("");
-                setPreview(null);
-                setInlineError(null);
-              }}
-              tone="secondary"
-              disabled={busy || saving || itemsText.trim().length === 0}
-            />
-          </View>
+          {textExpanded && (
+            <>
+                  <Text style={styles.sectionTitle}>What did you eat?</Text>
+                  <TextInput
+                    ref={inputRef}
+                    returnKeyType="done"
+                    blurOnSubmit={true}
+                    style={styles.input}
+                    placeholder='Example: "gatorade" or "chicken salad"'
+                    placeholderTextColor={UI.colors.textMuted}
+                    multiline
+                    value={itemsText}
+                    onChangeText={(t) => {
+                      setItemsText(t);
+                      setInlineError(null);
+                      setPreview(null);
+                    }}
+                    textAlignVertical="top"
+                  />
 
-          {inlineError ? <Text style={styles.inlineError}>{inlineError}</Text> : null}
+                  <View style={styles.rowSmall}>
+                    <PrimaryButton
+                      title="Clear"
+                      onPress={() => {
+                        setItemsText("");
+                        setPreview(null);
+                        setInlineError(null);
+                      }}
+                      tone="secondary"
+                      disabled={busy || saving || itemsText.trim().length === 0}
+                    />
+                  </View>
+
+                  {inlineError ? <Text style={styles.inlineError}>{inlineError}</Text> : null}
+                  </>
+          )}
         </View>
 
+        
+        <View style={{ flexDirection: "row", marginTop: 12, marginBottom: 12 }}>
+
+          <PrimaryButton
+            title={previewLoading ? "Previewing…" : "Preview score"}
+            onPress={onPreview}
+            disabled={busy || saving || previewLoading}
+            style={{ flex: 1, marginRight: 12 }}
+          />
+          <PrimaryButton
+            title={saving ? "Saving…" : "Save log"}
+            onPress={onSave}
+            disabled={busy || saving || !preview?.scoring}
+            tone="secondary"
+            style={{ flex: 1 }}
+          />
+        </View>
+        
+
+
+
+
         {preview?.scoring ? (
-          <View style={styles.card}>
+          <View style={[styles.card, { marginTop: 12 }]}>
             <Text style={styles.sectionTitle}>Preview</Text>
             <Text style={styles.bigScore}>{preview.scoring.score}</Text>
 
             {Array.isArray(preview.scoring.reasons) && preview.scoring.reasons.length > 0 ? (
               <View style={{ marginTop: UI.spacing.gapSm }}>
-                {preview.scoring.reasons.slice(0, 5).map((r: string, i: number) => (
+                {normalizeReasons(preview.scoring.reasons, { context: "food", max: 5 }).map((r: string, i: number) => (
                   <Text key={i} style={styles.reason}>
                     • {r}
                   </Text>
@@ -370,6 +484,13 @@ const styles = StyleSheet.create({
   tip: { color: UI.colors.textMuted, marginTop: UI.spacing.gapSm, lineHeight: 18 },
 
   sectionTitle: { color: UI.colors.text, fontWeight: "900", marginBottom: UI.spacing.gapSm, marginTop: 4 },
+  toggleText: {
+    color: UI.colors.textDim,
+    fontWeight: "800",
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  
   input: {
     minHeight: 110,
     borderRadius: UI.radius.inner,
@@ -386,4 +507,10 @@ const styles = StyleSheet.create({
 
   bigScore: { color: UI.colors.text, fontSize: 70, fontWeight: "900", marginTop: 4 },
   reason: { color: UI.colors.textDim, lineHeight: 18, marginTop: 2 },
+  btnText: {
+    // keep it simple; match your theme values if you have them
+    color: "#fff",
+    fontWeight: "900",
+    textAlign: "center",
+  },
 });

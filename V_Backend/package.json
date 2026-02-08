@@ -3,7 +3,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@walzia/platform": "workspace:*",
     "better-sqlite3": "^11.6.0",
     "express": "^4.19.2",
     "multer": "^2.0.2",

@@ -5,6 +5,44 @@ import type { MealInput } from "../contracts/meal-input";
 export type AppMode = "privacy" | "sync";
 export type ModeOpts = { mode: AppMode };
 
+
+
+
+export type ScoreContextV1 = "food_scan" | "menu_scan" | "eatout_menu";
+
+export type ScoreRequestV1 = {
+  context: ScoreContextV1;
+  input: {
+    text?: string;
+    menuItems?: Array<{ name: string; description?: string }>;
+  };
+};
+
+export type ScoreResponseV1 = {
+  scoring: {
+    score: number;
+    label?: string;
+    reasons: string[];
+  };
+};
+
+export async function scoreV1(req: ScoreRequestV1, opts: ModeOpts) {
+  if (opts.mode === "sync") {
+    // Sync-only: OpenAI authoritative (backend enriches with profile/goals/cuisines)
+    return apiPost<ScoreResponseV1>("/v1/sync/scan/score-v1", req);
+  }
+
+  // Privacy-only: deterministic scoring via profile router
+  // We convert to MealInput shape minimally to keep old system stable.
+  const input: any = {
+    capturedAt: new Date().toISOString(),
+    itemsText: req.input.text ?? "",
+  };
+  return scoreMealInputPreview(input, opts) as any;
+}
+
+
+
 // ------------------------------
 // Existing: meal preview + logs
 // ------------------------------
@@ -41,7 +79,7 @@ export async function createMealLog(req: CreateLogRequest, opts: ModeOpts) {
 
 export async function scoreMealInputPreview(input: MealInput, opts: ModeOpts) {
   // In privacy mode you may already have a stub endpoint. Keep existing behavior.
-  return apiPost<ScoreMealInputResponse>("/v1/meal/preview", { input, mode: opts.mode });
+  return apiPost<ScoreMealInputResponse>("/v1/profile/score-input-preview", { input });
 }
 
 export async function scanOcr(
@@ -91,8 +129,13 @@ export type EatOutScoreResponse = {
       why: string[];
       safeFallback: { shown: boolean; reason: string | null };
     }>;
+    overallConfidence?: number;
+    fallbackRecommended?: boolean;
+    fallbackReason?: string | null;
+    extracted?: { rawLines?: string[]; notes?: string[] };
   };
 };
+
 
 export async function syncEatOutMenuIngest(
   input: { menu_url?: string; menu_text?: string; upload_id?: string; items?: EatOutNormalizedItem[] },
@@ -113,6 +156,51 @@ export async function syncEatOutMenuScore(
   }
   return apiPost<EatOutScoreResponse>("/v1/sync/eatout/menu/score", input);
 }
+
+
+
+export type NearbyRestaurant = {
+  placeRefId: string;
+  name: string;
+  addressShort?: string | null;
+  rating?: number | null;
+  priceLevel?: number | null;
+  primaryType?: string | null;
+  types?: string[];
+};
+
+export type NearbyRestaurantsResponse = {
+  meta: { mode: AppMode; syncMode: boolean; requestId?: string };
+  data: { results: NearbyRestaurant[] };
+};
+
+export async function syncEatOutRestaurantsNearby(
+  input: { lat: number; lng: number; q?: string; cuisines?: string[]; radiusMeters?: number },
+  opts: ModeOpts
+) {
+  if (opts.mode !== "sync") throw new Error("MODE_BLOCKED");
+
+  const params = new URLSearchParams();
+  params.set("lat", String(input.lat));
+  params.set("lng", String(input.lng));
+  if (input.q) params.set("q", input.q);
+  if (input.radiusMeters) params.set("radius_meters", String(input.radiusMeters));
+  if (input.cuisines?.length) params.set("cuisines", input.cuisines.join(","));
+
+  return apiJson<NearbyRestaurantsResponse>(`/v1/sync/eatout/restaurants/nearby?${params.toString()}`);
+}
+
+export async function syncEatOutMenuScoreVision(
+  file: { uri: string; name: string; type: string },
+  opts: ModeOpts
+): Promise<EatOutScoreResponse> {
+  if (opts.mode !== "sync") throw new Error("MODE_BLOCKED");
+
+  const form = new FormData();
+  form.append("file", file as unknown as Blob);
+  return apiPostForm<EatOutScoreResponse>("/v1/sync/eatout/menu/score", form, {});
+}
+
 
 // ------------------------------
 // NEW: Menu snapshot (Overwrite + View + Status)
@@ -135,6 +223,7 @@ export type MenuSnapshot = {
   menuFingerprint: string;
   confidence: number;
   items: MenuSnapshotItem[];
+  extracted?: ExtractedPayload;
 };
 
 export type SnapshotStatusResponse = {
@@ -208,3 +297,16 @@ export async function syncEatOutPutSnapshot(
     body
   );
 }
+
+
+
+export type ExtractedPayload = {
+  rawLines?: string[];
+};
+
+export type PutSnapshotBody = {
+  menuSource?: string;
+  confidence?: number;
+  items: any[]; // whatever your current item type is
+  extracted?: ExtractedPayload;   // ✅ ADD THIS
+};
