@@ -9,6 +9,7 @@ import {
 } from "./service";
 import { buildMealContext } from "../profile/mealContext";
 import { scoreMealContext } from "../../utils/scoring";
+import { apiErr, apiOk, requireSyncMode } from "../../middleware/resolveContext";
 
 
 
@@ -22,7 +23,7 @@ export function logsRouter() {
   });
 
   // Create log for activeMemberId ONLY
-  r.post("/", (req, res) => {
+  r.post("/", requireSyncMode(), (req, res) => {
     const out = createLog(req, req.body);
     res.json(out);
   });
@@ -30,7 +31,7 @@ export function logsRouter() {
 
 // POST /v1/logs/from-input
 // body: { input: MealInput, summary?: string|null, capturedAt?: string|null }
-r.post("/from-input", async (req, res) => {
+/*r.post("/from-input", async (req, res) => {
   const ctx = getCtx(req);
   const db = getDb(req);
 
@@ -85,10 +86,10 @@ r.post("/from-input", async (req, res) => {
   // auditEvent(db, { type: "LOG_CREATE", ... })
 
   return res.json({ log: created });
-});
+});*/
 
   // Delete log (only if log belongs to allowed member)
-  r.delete("/:logId", (req, res) => {
+  r.delete("/:logId", requireSyncMode(), (req, res) => {
     const out = deleteLog(req, req.params.logId);
     res.json(out);
   });

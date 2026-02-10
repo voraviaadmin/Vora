@@ -212,8 +212,57 @@ export function createLog(req: Request, body: any) {
   // ✅ Score server-side only
   const { scoring, snapshot } = computeScoring(req, { nowIso: effectiveCapturedAt, mealType });
 
+  // ✅ If client already has AI score, persist it
+  const incomingScore =
+    typeof body?.score === "number" && Number.isFinite(body.score)
+      ? Math.max(0, Math.min(100, Math.trunc(body.score)))
+      : null;
+
   const syncOn = isSyncEnabled(db, actorUserId);
-  const scoringJson = syncOn ? JSON.stringify(snapshot) : null;
+
+  let finalScore: number;
+  let scoringJson: string | null = null;
+
+  if (incomingScore != null) {
+    finalScore = incomingScore;
+    if (syncOn) {
+      scoringJson = JSON.stringify({
+        score: finalScore,
+        mealType: mealType ?? null,
+        nowIso: effectiveCapturedAt,
+        source: "client",
+      });
+    }
+  } else {
+    const { scoring, snapshot } = computeScoring(req, { nowIso: effectiveCapturedAt, mealType });
+    finalScore = scoring.score;
+    scoringJson = syncOn ? JSON.stringify(snapshot) : null;
+  }
+
+  // ✅ Ensure member exists (clear error instead of FK crash)
+  const memberOk = db
+    .prepare("SELECT 1 FROM members WHERE memberId = ? AND deletedAt IS NULL")
+    .get(subjectMemberId);
+
+  if (!memberOk) {
+    const e: any = new Error("MEMBER_NOT_FOUND");
+    e.status = 409;
+    throw e;
+  }
+
+
+  if (placeRefId) {
+    const provider = "google";
+    db.prepare(`
+      INSERT INTO place_refs (placeRefId, provider, providerPlaceId)
+      VALUES (?, ?, ?)
+      ON CONFLICT(placeRefId) DO UPDATE SET
+        provider=excluded.provider,
+        providerPlaceId=excluded.providerPlaceId,
+        updatedAt=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(placeRefId, provider, placeRefId);
+  }
+  
 
   db.prepare(
     `
