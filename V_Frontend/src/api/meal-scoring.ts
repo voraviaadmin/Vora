@@ -18,13 +18,39 @@ export type ScoreRequestV1 = {
   };
 };
 
+export type AiScoringJson = {
+  score: number;
+  label: "Great" | "Good" | "hmm..Not so good";
+  why: string;
+  reasons: string[];
+  flags: string[];
+  nutritionNotes?: string | null;
+  estimates: {
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
+    sugar_g: number | null;
+    sodium_mg: number | null;
+  };
+  features?: {
+    cuisineMatch?: "high" | "medium" | "low";
+    goalAlignment?: "high" | "medium" | "low";
+    healthRisk?: "low" | "medium" | "high";
+    satiety?: "low" | "medium" | "high";
+  };
+};
+
 export type ScoreResponseV1 = {
   scoring: {
     score: number;
     label?: string;
     reasons: string[];
+    flags?: string[];
   };
+  scoringJson: AiScoringJson;
 };
+
 
 export async function scoreV1(req: ScoreRequestV1, opts: ModeOpts) {
   if (opts.mode === "sync") {
@@ -59,10 +85,15 @@ export type CreateLogRequest = {
   capturedAt?: string | null;
   mealType?: string | null;
 
+  // ✅ what makes logs show AI details
+  score?: number | null;
+  scoringJson?: AiScoringJson | null;
+
   // optional / future
   groupId?: string | null;
   placeRefId?: string | null;
 };
+
 
 export type CreateLogResponse = {
   ok: true;
@@ -128,6 +159,7 @@ export type EatOutScoreResponse = {
       confidence: number;
       why: string[];
       safeFallback: { shown: boolean; reason: string | null };
+      scoringJson?: AiScoringJson;
     }>;
     overallConfidence?: number;
     fallbackRecommended?: boolean;
@@ -213,7 +245,11 @@ export type MenuSnapshotItem = {
   scoreLabel: string | null;
   reasons: string[];
   flags: string[];
+
+  // ✅ if backend snapshot includes it, frontend can log without re-scoring
+  scoringJson?: AiScoringJson | null;
 };
+
 
 export type MenuSnapshot = {
   placeRefId: string;

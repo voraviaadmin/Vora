@@ -6,7 +6,8 @@ import multer from "multer";
 import { decryptProfile } from "../profile/crypto"; // adjust path to your actual profile module
 import { getSyncPreferences } from "./preferences";
 import { getDbFromReq } from "../../db/connection";
-import { openAiScoreVision, openAiScoreText } from "./openai-score";
+// ✅ Canonical scorer (single entrypoint)
+import { openAiScoreOneItem, openAiScoreManyText } from "../ai/openai-score";
 
 
 
@@ -49,57 +50,80 @@ function purgeExpired(db: Db) {
 }
 
 
-
-
-
-// Extract a safe, storage-ready item list (NO raw OCR)
 function normalizeSnapshotItems(payloadItems: any[]) {
-  return payloadItems
+  const DEBUG = process.env.DEBUG_SYNC === "1";
+
+  const norm = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+
+  return (payloadItems ?? [])
     .map((it: any, idx: number) => {
       const name = String(it?.name ?? "").trim();
       if (!name) return null;
 
-      const itemId = String(it?.itemId ?? `item-${idx}`);
+      const sj = it?.scoringJson ?? null;
 
-      // Support both shapes:
-      // - ranked[] from /menu/score: { name, score: {value,label}, why[] }
-      // - normalized[]: { name, ... }
+      // Stable itemId fallback (avoid idx)
+      const itemId = String(it?.itemId ?? `nm-${norm(name).replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, "-")}`);
+
       const scoreValue =
-        typeof it?.scoreValue === "number"
+        typeof sj?.score === "number"
+          ? sj.score
+          : typeof it?.scoreValue === "number"
           ? it.scoreValue
           : typeof it?.score?.value === "number"
           ? it.score.value
           : null;
 
       const scoreLabel =
-        typeof it?.scoreLabel === "string"
+        typeof sj?.label === "string"
+          ? sj.label
+          : typeof it?.scoreLabel === "string"
           ? it.scoreLabel
           : typeof it?.score?.label === "string"
           ? it.score.label
           : null;
 
       const reasons: string[] =
-        Array.isArray(it?.reasons)
-          ? it.reasons.map((r: any) => (typeof r === "string" ? r : String(r?.text ?? "")).trim()).filter(Boolean)
+        Array.isArray(sj?.reasons)
+          ? sj.reasons.map((r: any) => String(r ?? "").trim()).filter(Boolean)
+          : Array.isArray(it?.reasons)
+          ? it.reasons
+              .map((r: any) => (typeof r === "string" ? r : String(r?.text ?? "")).trim())
+              .filter(Boolean)
           : Array.isArray(it?.why)
           ? it.why.map((s: any) => String(s ?? "").trim()).filter(Boolean)
           : [];
 
-      const flags: string[] = Array.isArray(it?.flags)
+      const flags: string[] = Array.isArray(sj?.flags)
+        ? sj.flags.map((s: any) => String(s ?? "").trim()).filter(Boolean)
+        : Array.isArray(it?.flags)
         ? it.flags.map((s: any) => String(s ?? "").trim()).filter(Boolean)
         : [];
+
+      if (DEBUG) {
+        console.log("[snapshot] normalize item", {
+          name,
+          hasScoringJson: !!sj,
+          scoreValue,
+          scoreLabel,
+          reasonsCount: reasons.length,
+          flagsCount: flags.length,
+        });
+      }
 
       return {
         itemId,
         name,
         scoreValue,
         scoreLabel,
-        reasons: reasons.slice(0, 4), // keep short
+        scoringJson: sj, // ✅ canonical payload persisted
+        reasons: reasons.slice(0, 4),
         flags: flags.slice(0, 6),
       };
     })
     .filter(Boolean);
 }
+
 
 export function restaurantsRouter() {
   const router = express.Router();
@@ -162,166 +186,6 @@ function safeJsonParse(txt: string) {
   return JSON.parse(stripped);
 }
 
-
-async function openAiMenuScoreVision(args: {
-  apiKey: string;
-  model: string;
-  imageBuffer: Buffer;
-  mime: string;
-  preferences: any;
-}) {
-  const { apiKey, model, imageBuffer, mime, preferences } = args;
-
-  const b64 = imageBuffer.toString("base64");
-  const pref = preferences ?? null;
-
-  const prompt = {
-    role: "user",
-    content: [
-      {
-        type: "text",
-        text:
-`You are scoring restaurant menu items for a user.
-Use the user's profile preferences to score suitability.
-
-User preferences JSON:
-${JSON.stringify(pref)}
-
-Task:
-1) Extract menu items (food/drink) from the image.
-2) Return scored results per item.
-3) Keep reasons short and human-readable. No gibberish.
-4) If extraction is unreliable, lower confidence.
-
-Return STRICT JSON with:
-{
-  "items":[{"name":string,"score":number,"confidence":number,"reason":string}],
-  "rawLines":[string],
-  "overallConfidence":number
-}
-
-Rules:
-- score is 0..100
-- confidence is 0..1
-- reason max 140 chars
-- items max 40`
-      },
-      {
-        type: "input_image",
-        input_image: { url: `data:${mime};base64,${b64}` },
-      },
-    ],
-  };
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: [prompt],
-      temperature: 0.2,
-      max_output_tokens: 1200,
-    }),
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    console.error("OPENAI_FAIL_MENU_SCORE_VISION", resp.status, txt.slice(0, 400));
-    throw new Error(`OPENAI_VISION_FAILED:${resp.status}:${txt.slice(0, 250)}`);
-  }
-
-  const json = await resp.json();
-
-  // Responses API returns content in output[].content[].text; keep it defensive
-  const outText =
-    json?.output?.[0]?.content?.find((c: any) => c?.type === "output_text")?.text ??
-    json?.output_text ??
-    "";
-
-  // Strict JSON parse
-  let parsed: any = null;
-  try {
-    parsed = safeJsonParse(outText);
-  } catch {
-    parsed = null;
-  }
-
-  return parsed;
-}
-
-async function openAiMenuScoreText(args: {
-  apiKey: string;
-  model: string;
-  items: { name: string }[];
-  preferences: any;
-}) {
-  const { apiKey, model, items, preferences } = args;
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-`You are scoring selected menu items for a user.
-User preferences JSON:
-${JSON.stringify(preferences ?? null)}
-
-Selected items:
-${JSON.stringify(items)}
-
-Return STRICT JSON:
-{
-  "items":[{"name":string,"score":number,"confidence":number,"reason":string}],
-  "overallConfidence":number
-}
-
-Rules:
-- score 0..100
-- confidence 0..1
-- reason max 140 chars
-- items must match provided names (no hallucinated items)`
-            },
-          ],
-        },
-      ],
-      temperature: 0.2,
-      max_output_tokens: 900,
-    }),
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    console.error("OPENAI_FAIL_MENU_SCORE_TEXT", resp.status, txt.slice(0, 250));
-    throw new Error(`OPENAI_TEXT_FAILED:${resp.status}:${txt.slice(0, 250)}`);
-  }
-
-  const json = await resp.json();
-  const outText =
-    json?.output?.[0]?.content?.find((c: any) => c?.type === "output_text")?.text ??
-    json?.output_text ??
-    "";
-
-  let parsed: any = null;
-  try {
-    parsed = safeJsonParse(outText);
-  } catch {
-    parsed = null;
-  }
-  return parsed;
-}
 
 function clamp01(x: any) {
   const n = typeof x === "number" ? x : Number(x);
@@ -423,10 +287,6 @@ export function syncEatOutRouter() {
     }
   });
   
-  
-
-
-
 
   // Phase 1: ingest (existing)
   router.post("/menu/ingest", requireSyncMode(), (req, res) => {
@@ -469,144 +329,108 @@ export function syncEatOutRouter() {
   });
 
   // Phase 1: score (existing)
-  router.post(
-    "/menu/score",
-    requireSyncMode(),
-    upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),
-    async (req, res) => {
-      try {
-        const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
-        if (!apiKey) {
-          const r = apiErr(req, "MISSING_OPENAI_KEY", "Menu scoring is not configured.", "Try again later.", 500, false);
+ /**
+   * ✅ NEW: /menu/score returns scoringJson per item (canonical contract)
+   * - No inline OpenAI calls here
+   * - No API key passed from router
+   * - Router only maps inputs and returns outputs
+   */
+ router.post(
+  "/menu/score",
+  requireSyncMode(),
+  upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),
+  async (req, res) => {
+    try {
+      const prefs = getSyncPreferences(req);
+
+      const files = req.files as any;
+      const f = files?.file?.[0] ?? files?.image?.[0];
+
+      const bodyItems = Array.isArray(req.body?.items) ? req.body.items : [];
+      const items = bodyItems
+        .map((it: any) => ({
+          itemId: String(it?.itemId ?? ""),
+          name: String(it?.name ?? "").trim(),
+          ingredients: String(it?.description ?? it?.ingredients ?? "").trim() || null,
+        }))
+        .filter((x: any) => !!x.name)
+        .slice(0, 50);
+
+      // NOTE: Current canonical contract does not include confidence.
+      // We keep fallbackRecommended simple: only when AI fails or no items.
+      let ranked: any[] = [];
+
+      if (f?.buffer) {
+        // Vision path: score ONE best-effort item (or later: extract items in separate parsing step)
+        const mime = String(f.mimetype ?? "").toLowerCase();
+        const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+        if (!allowed.has(mime)) {
+          const r = apiErr(req, "UNSUPPORTED_MEDIA", "Menu scan requires an image.", "Upload JPG/PNG/WebP.", 415, true);
           return res.status(r.status).json(r.body);
         }
-  
-        const prefs = getSyncPreferences(req);
-        const lowThresh = Number(process.env.EATOUT_LOW_CONFIDENCE_THRESHOLD ?? 0.55);
-  
-        const files = req.files as any;
-        const f = files?.file?.[0] ?? files?.image?.[0];
-  
-        const bodyItems = Array.isArray(req.body?.items) ? req.body.items : [];
-        const items = bodyItems
-          .map((it: any) => ({ name: String(it?.name ?? "").trim() }))
-          .filter((x: any) => !!x.name)
-          .slice(0, 50);
 
-
-          console.log("MENU_SCORE_INPUT", {
-            hasFile: Boolean(f?.buffer),
-            itemsCount: items.length,
-            hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
-          });
-          
-  
-        let parsed: any = null;
-  
-        if (f?.buffer) {
-          const mime = String(f.mimetype ?? "").toLowerCase();
-          const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
-          if (!allowed.has(mime)) {
-            const r = apiErr(req, "UNSUPPORTED_MEDIA", "Menu scan requires an image.", "Upload JPG/PNG/WebP.", 415, true);
-            return res.status(r.status).json(r.body);
-          }
-  
-          parsed = await openAiScoreVision({
-            apiKey,
-            model: String(process.env.OPENAI_VISION_MODEL ?? "gpt-4o-mini"),
-            imageBuffer: f.buffer,
-            mime,
-            preferences: prefs,
-          });
-        } else {
-          if (!items.length) {
-            const r = apiErr(req, "MISSING_ITEMS", "No menu items provided.", "Scan the menu or select items manually.", 400, true);
-            return res.status(r.status).json(r.body);
-          }
-  
-          parsed = await openAiScoreText({
-            apiKey,
-            model: String(process.env.OPENAI_TEXT_MODEL ?? "gpt-4o-mini"),
-            items,
-            preferences: prefs,
-          });
-        }
-  
-        if (!parsed || !Array.isArray(parsed.items)) {
-          const r = apiErr(req, "AI_BAD_OUTPUT", "We couldn’t read the menu reliably.", "Try Manual Select.", 502, true);
-          return res.status(r.status).json({
-            ...r.body,
-            data: {
-              ranked: [],
-              overallConfidence: 0,
-              fallbackRecommended: true,
-              fallbackReason: "MODEL_OUTPUT_INVALID",
-              extracted: { rawLines: Array.isArray(parsed?.rawLines) ? parsed.rawLines : [], notes: [] },
-            },
-          });
-        }
-  
-        const ranked = parsed.items
-          .map((it: any, idx: number) => {
-            const name = String(it?.name ?? "").trim();
-            if (!name) return null;
-  
-            const scoreVal = clampScore(it?.score);
-            const conf = clamp01(it?.confidence);
-  
-            return {
-              itemId: `item-${idx}`,
-              name,
-              score: {
-                value: scoreVal,
-                label: scoreVal >= 80 ? "Great" : scoreVal >= 65 ? "Good" : "Needs work",
-                kind: "personalized",
-              },
-              confidence: conf,
-              why: [String(it?.reason ?? "").trim()].filter(Boolean).slice(0, 1),
-              safeFallback: { shown: false, reason: null },
-            };
-          })
-          .filter(Boolean)
-          .slice(0, 40);
-  
-        const overallConfidence = clamp01(
-          parsed?.overallConfidence ??
-            (ranked.length
-              ? ranked.reduce((a: number, r: any) => a + (r.confidence ?? 0), 0) / ranked.length
-              : 0)
-        );
-  
-        const fallbackRecommended = overallConfidence < lowThresh || ranked.length === 0;
-  
-        return res.json(
-          apiOk(req, {
-            ranked,
-            overallConfidence,
-            fallbackRecommended,
-            fallbackReason: fallbackRecommended ? (ranked.length === 0 ? "NO_ITEMS_EXTRACTED" : "LOW_CONFIDENCE") : null,
-            extracted: {
-              rawLines: Array.isArray(parsed?.rawLines)
-                ? parsed.rawLines.slice(0, 160).map((s: any) => String(s ?? "").trim()).filter(Boolean)
-                : [],
-              notes: [],
-            },
-          })
-        );
-      } catch {
-        const r = apiErr(req, "MENU_SCORE_FAILED", "We couldn’t score this menu.", "Try Manual Select.", 502, true);
-        return res.status(r.status).json({
-          ...r.body,
-          data: {
-            ranked: [],
-            overallConfidence: 0,
-            fallbackRecommended: true,
-            fallbackReason: "VISION_OR_PROVIDER_FAILED",
-          },
+        // For now, use OCR/extraction phase separately; vision scoring here is “single item”.
+        // If you want multi-item extraction from a menu image, that becomes a separate extractor step.
+        const scoringJson = await openAiScoreOneItem({
+          source: "menu",
+          mode: "vision",
+          imageBuffer: f.buffer,
+          mime,
+          detectedText: null,
+          userPreferences: prefs,
         });
+
+        ranked = [
+          {
+            itemId: "item-0",
+            name: "Menu item (from image)",
+            score: { value: scoringJson.score, label: scoringJson.label, kind: "personalized" },
+            scoringJson,
+          },
+        ];
+      } else {
+        if (!items.length) {
+          const r = apiErr(req, "MISSING_ITEMS", "No menu items provided.", "Scan the menu or select items manually.", 400, true);
+          return res.status(r.status).json(r.body);
+        }
+
+        const scored = await openAiScoreManyText({
+          source: "menu",
+          items: items.map((x: any) => ({ name: x.name, ingredients: x.ingredients })),
+          userPreferences: prefs,
+        });
+
+        ranked = scored.map((x, idx) => ({
+          itemId: items[idx]?.itemId || `item-${idx}`,
+          name: x.name,
+          score: { value: x.scoringJson.score, label: x.scoringJson.label, kind: "personalized" },
+          scoringJson: x.scoringJson,
+        }));
       }
+
+      return res.json(
+        apiOk(req, {
+          ranked,
+          overallConfidence: null,
+          fallbackRecommended: ranked.length === 0,
+          fallbackReason: ranked.length === 0 ? "NO_ITEMS_SCORED" : null,
+          extracted: { rawLines: [], notes: [] },
+        })
+      );
+    } catch (e: any) {
+      const r = apiErr(req, "MENU_SCORE_FAILED", "We couldn’t score this menu.", "Try Manual Select.", 502, true);
+      return res.status(r.status).json({
+        ...r.body,
+        data: {
+          ranked: [],
+          overallConfidence: null,
+          fallbackRecommended: true,
+          fallbackReason: e?.message ?? "AI_PROVIDER_FAILED",
+        },
+      });
     }
-  );
+  }
+);
   
   
 

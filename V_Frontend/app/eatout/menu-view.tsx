@@ -120,6 +120,10 @@ export default function MenuViewScreen() {
         return;
       }
 
+
+
+      console.log("saving snapshot for", placeRefId);
+
       setLoading(true);
       try {
         const resp = await syncEatOutGetSnapshot(placeRefId, { mode });
@@ -131,6 +135,8 @@ export default function MenuViewScreen() {
         setLoading(false);
       }
     }
+    console.log("menu-view loading snapshot for", placeRefId);
+
     load();
   }, [isSync, placeRefId, mode, router]);
 
@@ -175,15 +181,49 @@ export default function MenuViewScreen() {
 
     setSaving(true);
     try {
-      const resp: any = await createMealLog(
-        {
-          summary,
-          capturedAt: new Date().toISOString(),
-          mealType,
-          placeRefId: logPlaceRefId,
-        },
-        { mode }
-      );
+
+
+      const scoringJson = (selected as any)?.scoringJson ?? null;
+const score = selected?.scoreValue ?? null;
+
+if (isSync && !scoringJson) {
+  Alert.alert(
+    "Missing score details",
+    "This item was not saved with full AI scoring details. Please re-score the menu items, then log again."
+          );
+          setSaving(false);
+          return;
+        }
+
+
+        const sj = (selected as any)?.scoringJson ?? null;
+if (!sj) {
+  Alert.alert(
+    "Missing score details",
+    "This item was not saved with full AI scoring details. Please re-score the menu items, then log again."
+  );
+  return;
+}
+
+
+        const resp: any = createMealLog(
+          {
+            summary,
+            capturedAt: new Date().toISOString(),
+            mealType,
+            placeRefId: logPlaceRefId,
+        
+            // ✅ canonical payload — must flow end-to-end unchanged
+            scoringJson: sj,
+        
+            // Optional helpful metadata (safe, not source of truth)
+            source: "eatout_menu",
+            itemId: (selected as any)?.itemId ?? null,
+            itemName: selected.name,
+          } as any,
+          { mode }
+        );
+
 
       // createMealLog returns {ok:false,...} when blocked; but in sync it should be API response
       if (resp?.ok === false) {

@@ -1,64 +1,41 @@
 import { hasOpenAIKey } from "../../config/openai";
-import { openAiScoreText, openAiScoreVision } from "./openai-score"; // adjust if file name differs
+import { openAiScoreOneItem } from "../ai/openai-score";
 
+type UserPreferences = any; // keep loose until you formalize prefs schema
+
+/**
+ * Sync-mode scoring for Scan (food text).
+ * Canonical rule: AI returns scoringJson (immutable) and we pass it through unchanged.
+ */
 export async function scoreFoodScanSync(args: {
-  apiKey: string;
-  modelText: string;
-  modelVision: string;
-  text?: string;
-  imageBuffer?: Buffer;
-  mime?: string;
-  preferences: any;
+  text: string;
+  preferences: UserPreferences;
 }) {
   if (!hasOpenAIKey()) {
     throw new Error("OPENAI_NOT_CONFIGURED");
   }
 
-  const { apiKey, modelText, modelVision, text, imageBuffer, mime, preferences } = args;
+  const t = String(args.text ?? "").trim();
+  if (!t) throw new Error("MISSING_TEXT");
 
-  let parsed: any;
+  const scoringJson = await openAiScoreOneItem({
+    source: "scan",
+    mode: "text",
+    itemName: t,
+    ingredients: null,
+    cuisine: null,
+    mealType: null,
+    userPreferences: args.preferences,
+  });
 
-  // CAMERA FLOW
-  if (imageBuffer) {
-    if (!mime) throw new Error("MISSING_MIME");
-
-    parsed = await openAiScoreVision({
-      apiKey,
-      model: modelVision,
-      imageBuffer,
-      mime,
-      preferences,
-    });
-  }
-  // TEXT FLOW
-  else {
-    const t = String(text ?? "").trim();
-    if (!t) throw new Error("MISSING_TEXT");
-
-    parsed = await openAiScoreText({
-      apiKey,
-      model: modelText,
-      items: [{ name: t }],
-      preferences,
-    });
-  }
-
-  const first = Array.isArray(parsed?.items) ? parsed.items[0] : null;
-
-  const score = Math.max(0, Math.min(100, Number(first?.score ?? 0)));
-  const reason = String(first?.reason ?? "").trim();
-
+  // ✅ Return both: minimal summary (for quick UI) + canonical scoringJson (immutable)
   return {
     scoring: {
-      score,
-      label: score >= 80 ? "Great" : score >= 65 ? "Good" : "Needs work",
-      reasons: reason
-        ? [reason]
-        : [
-            "Accounting for your health profile and goals.",
-            "Based on typical nutrition impact for this food.",
-            "Consistency improves accuracy over time.",
-          ],
+      score: scoringJson.score,
+      label: scoringJson.label, // "Good" | "Ok" | "Not Preferred"
+      reasons: scoringJson.reasons ?? [],
+      flags: scoringJson.flags ?? [],
     },
+    scoringJson,
   };
 }

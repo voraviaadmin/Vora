@@ -28,7 +28,8 @@ import { scoreV1 } from "../../api/meal-scoring";
 
 
 
-type Preview = { scoring?: any };
+type Preview = { scoring?: any; scoringJson?: any };
+
 
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 type StartMode = "camera" | "text";
@@ -215,7 +216,8 @@ if (ocrResp?.meta?.blocked) {
         { context: "food_scan", input: { text } },
         { mode }
       );
-  
+      console.log("preview keys:", Object.keys(res.data ?? {}));
+
       setPreview(res.data);
     } catch (e: any) {
       setInlineError(e?.message ?? "Couldn't preview right now.");
@@ -261,10 +263,25 @@ if (ocrResp?.meta?.blocked) {
       }
   
       // ☁️ SYNC MODE (existing behavior)
+      const scoringJson = preview?.scoringJson ?? null;
+      const score = preview?.scoring?.score ?? null;
+      
+      if (mode === "sync" && !scoringJson) {
+        Alert.alert("Save log", "Missing AI scoring details. Please preview score again.");
+        return;
+      }
+      
       const out = await createMealLog(
-        { summary: text, capturedAt: new Date().toISOString(), mealType },
+        {
+          summary: text,
+          capturedAt: new Date().toISOString(),
+          mealType,
+          score,
+          scoringJson, // ✅ critical for Logs
+        },
         { mode }
       );
+      
   
       if ("logId" in out) {
         invalidateHomeSummary();

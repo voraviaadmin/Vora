@@ -48,7 +48,7 @@ type LogRow = {
   capturedAt: string | null;
   createdAt: string;
   updatedAt: string;
-  scoring?: { score: number; reasons: string[]; signals: any; mealType?: string | null; nowIso?: string } | null;
+  scoring?: any | null; // canonical AiScoringJson (keep loose to avoid breakage)
 };
 
 type TrendDaily = { day: string; count: number; avgScore: number | null };
@@ -357,19 +357,24 @@ const loadAll = useCallback(
 
 
         {explanation ? (
+
             <ScoringPanel
-              scoring={{
-                score: explanation.score,
-                reasons: normalizeReasons(explanation.reasons, { context: "log", max: 5 }),
-                signals: explanation.signals,
-              }}
-              explained={explanationSource === "per-log"}
-              privacyTip={
-                explanationSource === "fallback"
-                  ? "Turn on Sync to store encrypted, per-log explanations across devices."
-                  : undefined
-              }
+            explained={explanationSource === "per-log" && (Boolean(explanation?.why) || (explanation?.reasons?.length ?? 0) > 0)}
+            scoring={{
+              score: explanation.score,
+              reasons: normalizeReasons(explanation.reasons ?? [], { context: "log", max: 5 }),
+              signals: {
+                label: explanation.label,
+                why: explanation.why,
+                flags: explanation.flags ?? [], 
+                nutritionNotes: explanation.nutritionNotes ?? null,
+                estimates: explanation.estimates ?? null,
+                features: explanation.features ?? null,
+              },
+            }}
             />
+
+
           ) : scorePreviewLoading ? (
             <View style={{ flexDirection: "row", alignItems: "center", gap: UI.spacing.gap }}>
               <ActivityIndicator />

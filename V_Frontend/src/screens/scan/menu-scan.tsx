@@ -139,14 +139,23 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
         return;
       }
   
-      // Save snapshot immediately (zero patience)
-      const snapshotItems = ranked.map((r) => ({
-        name: r.name,
-        scoreValue: r.score?.value ?? undefined,
-        scoreLabel: r.score?.label ?? undefined,
-        reasons: Array.isArray(r.why) ? r.why : [],
-        flags: [],
-      }));
+      const snapshotItems = ranked.map((r: any) => {
+        const sj = r.scoringJson ?? null;
+      
+        return {
+          name: r.name,
+          scoreValue: sj?.score ?? r.score?.value ?? undefined,
+          scoreLabel: sj?.label ?? r.score?.label ?? undefined,
+      
+          // ✅ Persist canonical AI payload (immutable)
+          scoringJson: sj,
+      
+          // Optional helpers (keep these if you want fast list rendering)
+          reasons: Array.isArray(sj?.reasons) ? sj.reasons : [],
+          flags: Array.isArray(sj?.flags) ? sj.flags : [],
+        };
+      });
+      
 
   
       await clearLocalMenuDraft(placeRefId);
@@ -165,7 +174,44 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
     }
   }
   
+  async function runDetection(uri: string) {
+    setDetecting(true);
+    try {
+      const boxes = await detectMenuTextBoxes(uri);
+      const rawLines = boxes.map((b) => b.text);
+      const folded = foldDescriptions(rawLines);
+      const candidates = buildMenuCandidates(folded);
+  
+      if (!candidates.length) {
+        setFallbackRecommended(true);
+        setFallbackReason("NO_TEXT_DETECTED");
+        setCandidates([]);
+        return;
+      }
+  
+      setCandidates(
+        candidates.map((c, idx) => ({
+          id: `c-${idx}-${c.norm}`,
+          name: c.text,
+          confidence: c.confidence,
+        }))
+      );
 
+      //console.log("[menu-scan] boxes:", boxes.length, boxes.slice(0, 5));
+      //console.log("[menu-scan] rawLines:", rawLines.length);
+      //console.log("[menu-scan] folded:", folded.length, folded.slice(0, 10));
+      //console.log("[menu-scan] candidates:", candidates.length, candidates.slice(0, 10));
+
+
+    } catch (e) {
+      setFallbackRecommended(true);
+      setFallbackReason("DETECTION_FAILED");
+      setCandidates([]);
+    } finally {
+      setDetecting(false);
+    }
+  }
+  
 
 
   async function openCamera() {
@@ -196,16 +242,18 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
       }
 
       setPhotoUri(uri);
+      await runDetection(uri); // <-- must happen every time
 
-      if (isSync) {
+      /*if (isSync) {
         void runVisionScore(uri);
       } else {
         void runDetection(uri);
-      }
-      
+      }*/
 
-      // Phase 1: on-device detection -> parsed candidates list
-      void runDetection(uri);
+      // Always run local detection to build candidates.
+      // Sync scoring happens only when user taps "Score & Save".
+    
+
     } catch (e: any) {
       Alert.alert("Scan failed", e?.message ?? "Please try again.");
       router.back();
@@ -214,35 +262,7 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
     }
   }
 
-  async function runDetection(uri: string) {
-    setDetecting(true);
-    try {
-      const boxes = await detectMenuTextBoxes(uri);
-      const rawLines = boxes.map((b) => b.text);
-      const folded = foldDescriptions(rawLines);
-  
-      const candidates = buildMenuCandidates(folded);
-  
 
-      setCandidates(
-        candidates.map((c, idx) => ({
-          id: `c-${idx}-${c.norm}`,
-          name: c.text,
-          confidence: c.confidence,
-        }))
-      );
-  
-
-      setSelected((prev) => prev); // never auto-select
-
-
-
-    } catch {
-      setCandidates([]);
-    } finally {
-      setDetecting(false);
-    }
-  }
   
 
   function addManualItem() {
@@ -287,25 +307,55 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
       .trim();
   }
   
-  function mergeByName(existing: any[], incoming: any[]) {
+  function mergeMenuItems(existing: any[], incoming: any[]) {
+    const keyFor = (it: any) => {
+      const id = String(it?.itemId ?? "").trim();
+      if (id) return `id:${id}`;
+      const nm = normName(it?.name);
+      return nm ? `nm:${nm}` : "";
+    };
+  
     const map = new Map<string, any>();
   
-    // keep existing first (so it preserves older score/itemId if present)
-    for (const it of existing || []) {
-      const key = normName(it?.name);
-      if (!key) continue;
-      if (!map.has(key)) map.set(key, it);
-    }
+    const put = (it: any) => {
+      const k = keyFor(it);
+      if (!k) return;
   
-    // add incoming only if new
-    for (const it of incoming || []) {
-      const key = normName(it?.name);
-      if (!key) continue;
-      if (!map.has(key)) map.set(key, it);
-    }
+      const prev = map.get(k);
+      if (!prev) {
+        map.set(k, it);
+        return;
+      }
+  
+      const prevHasSj = !!prev?.scoringJson;
+      const nextHasSj = !!it?.scoringJson;
+  
+      // Prefer canonical payload when incoming has it and prev doesn't
+      if (nextHasSj && !prevHasSj) {
+        map.set(k, it);
+        return;
+      }
+  
+      // If both have canonical payload, prefer incoming (latest)
+      if (nextHasSj && prevHasSj) {
+        map.set(k, { ...prev, ...it, scoringJson: it.scoringJson });
+        return;
+      }
+  
+      // Otherwise: preserve existing scoringJson, but merge in other updates
+      map.set(k, {
+        ...prev,
+        ...it,
+        scoringJson: prev?.scoringJson ?? it?.scoringJson ?? null,
+      });
+    };
+  
+    for (const it of existing || []) put(it);
+    for (const it of incoming || []) put(it);
   
     return Array.from(map.values());
   }
+  
   
   
 
@@ -337,17 +387,45 @@ const [fallbackReason, setFallbackReason] = useState<string | null>(null);
 
       // 2) persist snapshot (overwrite allowed; backend enforces 30-day expiry)
 // build items from this save
+//const ranked = scoreResp?.data?.ranked ?? [];
+
+//console.log("scoreResp data", JSON.stringify(scoreResp?.data, null, 2));
+
+
 const ranked = scoreResp?.data?.ranked ?? [];
+
 const snapshotItems =
   ranked.length > 0
     ? ranked.map((r: any) => ({
+        // ✅ keep item identity (important for restaurant+item uniqueness)
+        itemId: r.itemId ?? null,
         name: r.name,
-        scoreValue: r.score?.value ?? undefined,
-        scoreLabel: r.score?.label ?? undefined,
-        reasons: Array.isArray(r.why) ? r.why : [],
-        flags: [],
+
+        // ✅ keep summary fields (fast UI)
+        scoreValue: r.score?.value ?? r.scoringJson?.score ?? null,
+        scoreLabel: r.score?.label ?? r.scoringJson?.label ?? null,
+
+        // ✅ canonical immutable payload
+        scoringJson: r.scoringJson ?? null,
+
+        // Optional UI helpers (derived, not source of truth)
+        reasons: Array.isArray(r.scoringJson?.reasons) ? r.scoringJson.reasons : [],
+        flags: Array.isArray(r.scoringJson?.flags) ? r.scoringJson.flags : [],
       }))
-    : selected.map((s) => ({ name: s.name }));
+    : selected.map((s, idx) => ({
+        itemId: `sel-${idx}-${s.name.toLowerCase().replace(/\s+/g, "-")}`,
+        name: s.name,
+        scoringJson: null,
+        scoreValue: null,
+        scoreLabel: null,
+        reasons: [],
+        flags: [],
+      }));
+
+
+    //console.log("ranked[0] keys", ranked?.[0] ? Object.keys(ranked[0]) : "none");
+    //console.log("ranked[0]", ranked?.[0]);
+    
 
 // 1) compute newItems from this scan
 const newItems =
@@ -373,8 +451,10 @@ try {
   // ok if none exists
 }
 
+
 // 4) merge + dedupe
-const mergedItems = mergeByName(existingItems, newItems);
+const mergedItems = mergeMenuItems(existingItems, newItems);
+
 
 const mergedRawLines = Array.from(
   new Set(
@@ -383,6 +463,9 @@ const mergedRawLines = Array.from(
       .filter(Boolean)
   )
 );
+
+//console.log("merged items WITH scoringJson", mergedItems.filter(i => !!i.scoringJson).length);
+//console.log("merged items TOTAL", mergedItems.length);
 
 // 5) ONE write (upsert)
 await syncEatOutPutSnapshot(
@@ -395,12 +478,18 @@ await syncEatOutPutSnapshot(
   { mode: "sync" }
 );
 
+const verify = await syncEatOutGetSnapshot(placeRefId, { mode: "sync" });
+const its = verify?.data?.snapshot?.items ?? [];
+console.log(
+  "snapshot stored scoringJson count",
+  its.filter((i: any) => !!i.scoringJson).length,
+  "total",
+  its.length
+);
+
 
 
       await clearLocalMenuDraft(placeRefId);
-
-
-
 
       // 3) navigate to view screen (new page, no inline expand)
       router.replace({
@@ -413,14 +502,16 @@ await syncEatOutPutSnapshot(
         e?.message === "MODE_BLOCKED" ||
         e?.code === "MODE_BLOCKED";
     
-      const msg =
+        const msg =
         modeBlocked
           ? "Switch to Sync mode to score and save."
-          : (e?.response?.data?.error?.message ||
-             e?.response?.data?.message ||
-             e?.message ||
-             (typeof e === "string" ? e : JSON.stringify(e, null, 2)));
-    
+          : e?.response?.data?.error?.message ||
+            e?.response?.data?.message ||
+            e?.body?.error?.message ||
+            e?.error?.message ||
+            e?.message ||
+            (typeof e === "string" ? e : JSON.stringify(e, null, 2));
+      
       Alert.alert("Could not save menu", msg);
     } finally {
       setSaving(false);
@@ -485,7 +576,7 @@ await syncEatOutPutSnapshot(
     ? "Scanning… then scoring with your profile."
     : fallbackRecommended
       ? "We’re not confident reading this menu. Use Manual Select."
-      : "Sync mode: scan + score automatically (profile-aware)."
+      : "Sync mode: scan → select items → score (profile-aware)."
   : "Privacy mode: on-device scan only (nothing sent)."}
         </Text>
 
@@ -512,7 +603,7 @@ await syncEatOutPutSnapshot(
         </View>
 
 
-        {(!isSync || fallbackRecommended) && (
+        {(candidates.length > 0 || detecting || fallbackRecommended || !isSync) && (
           <>
             <View style={styles.section}>
               <Text style={styles.h2}>Tap dishes you’re considering</Text>

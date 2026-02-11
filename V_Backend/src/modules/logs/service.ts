@@ -3,6 +3,8 @@ import { randomUUID } from "crypto";
 import { writeAuditEvent } from "../../audit/audit";
 import { buildMealContext } from "../profile/mealContext";
 import { scoreMealContext } from "../../utils/scoring";
+import { safeParseAiScoring, stringifyAiScoring } from "../scoring";
+
 
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 
@@ -210,34 +212,61 @@ export function createLog(req: Request, body: any) {
   const effectiveCapturedAt = capturedAtIso ?? now;
 
   // ✅ Score server-side only
-  const { scoring, snapshot } = computeScoring(req, { nowIso: effectiveCapturedAt, mealType });
+  // const { scoring, snapshot } = computeScoring(req, { nowIso: effectiveCapturedAt, mealType });
 
-  // ✅ If client already has AI score, persist it
+  const syncOn = isSyncEnabled(db, actorUserId);
+
+  // If client sends scoringJson (AI output), store it unchanged (Sync-only)
+  let scoringJson: string | null = null;
+  
+  // This is the only "premium" path that preserves AI explainability end-to-end.
+  const incomingScoring = safeParseAiScoring(body?.scoringJson);
+  
+  // Backward compat: allow legacy "score" only (but it won't have rich explainability)
   const incomingScore =
     typeof body?.score === "number" && Number.isFinite(body.score)
       ? Math.max(0, Math.min(100, Math.trunc(body.score)))
       : null;
-
-  const syncOn = isSyncEnabled(db, actorUserId);
-
+  
   let finalScore: number;
-  let scoringJson: string | null = null;
-
-  if (incomingScore != null) {
+  
+  if (syncOn && incomingScoring) {
+    // ✅ Canonical: AI is source of truth
+    finalScore = Math.trunc(incomingScoring.score);
+    scoringJson = stringifyAiScoring(incomingScoring);
+  } else if (incomingScore != null) {
+    // Legacy support: client provided score but no scoringJson
     finalScore = incomingScore;
-    if (syncOn) {
-      scoringJson = JSON.stringify({
-        score: finalScore,
-        mealType: mealType ?? null,
-        nowIso: effectiveCapturedAt,
-        source: "client",
-      });
-    }
+    scoringJson = syncOn
+      ? JSON.stringify({
+          score: finalScore,
+          label: "Ok",
+          why: "Saved score without AI explanation.",
+          reasons: [],
+          flags: [],
+          nutritionNotes: null,
+          estimates: {
+            calories: null,
+            protein_g: null,
+            carbs_g: null,
+            fat_g: null,
+            sugar_g: null,
+            sodium_mg: null,
+          },
+          features: undefined,
+        })
+      : null;
   } else {
+    // Privacy/baseline: server scores (your existing deterministic pipeline)
     const { scoring, snapshot } = computeScoring(req, { nowIso: effectiveCapturedAt, mealType });
     finalScore = scoring.score;
+  
+    // IMPORTANT:
+    // - If you want Sync logs to ONLY store AI scoringJson, you can set this to null in sync mode.
+    // - For now we keep your snapshot when AI scoringJson isn't provided.
     scoringJson = syncOn ? JSON.stringify(snapshot) : null;
   }
+  
 
   // ✅ Ensure member exists (clear error instead of FK crash)
   const memberOk = db
@@ -290,7 +319,7 @@ export function createLog(req: Request, body: any) {
     placeRefId,
     mealType,
     effectiveCapturedAt,
-    scoring.score,
+    finalScore,
     scoringJson,
     summary,
     now,
@@ -307,7 +336,7 @@ export function createLog(req: Request, body: any) {
     userAgent: req.headers["user-agent"],
     metadata: {
       mealType,
-      score: scoring.score,
+      score: finalScore,
       groupId,
       syncStored: syncOn && !!scoringJson,
     },
@@ -323,10 +352,22 @@ export function createLog(req: Request, body: any) {
     ip: req.ip,
     userAgent: req.headers["user-agent"],
     metadata: {
-      score: scoring.score,
+      score: finalScore,
       syncStored: syncOn && !!scoringJson,
     },
   });
+
+  let scoringObj: any = null;
+  if (scoringJson) {
+    try {
+      scoringObj = JSON.parse(scoringJson);
+    } catch {
+      scoringObj = null;
+    }
+  }
+  
+
+
 
   return {
     logId,
@@ -336,11 +377,17 @@ export function createLog(req: Request, body: any) {
     placeRefId,
     mealType,
     capturedAt: effectiveCapturedAt,
-    score: scoring.score,
-    scoring: syncOn ? snapshot : null, // return snapshot immediately if stored
-    summary,
-    createdAt: now,
-    updatedAt: now,
+  score: finalScore,
+
+  // ✅ This is what Logs UI should render (why/reasons/flags/estimates/features)
+  scoring: scoringObj,
+
+  // ✅ Optional but helpful for the frontend to persist/display verbatim
+  scoringJson: scoringObj,
+
+  summary,
+  createdAt: now,
+  updatedAt: now,
   };
 }
 
