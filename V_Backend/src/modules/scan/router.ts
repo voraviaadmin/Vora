@@ -143,6 +143,61 @@ scanRouter.post("/analyze", async (req, res) => {
   }
 });
 
+const syncScanVisionScoreHandler = async (req: any, res: any) => {
+  try {
+    const files = req.files as any;
+    const f = files?.file?.[0] ?? files?.image?.[0];
+
+    if (!f?.buffer) {
+      const r = apiErr(req, "MISSING_IMAGE", "No photo provided.", "Take a photo and try again.", 400, true);
+      return res.status(r.status).json(r.body);
+    }
+
+    const mime = (f.mimetype ?? "").toLowerCase();
+    const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+    if (!allowed.has(mime)) {
+      const r = apiErr(req, "UNSUPPORTED_MEDIA_TYPE", "Unsupported image type.", "Use JPG/PNG/WebP.", 415, true);
+      return res.status(r.status).json(r.body);
+    }
+
+    const prefs = getSyncPreferences(req);
+
+    const out = await openAiScoreOneItem({
+      source: "scan",
+      mode: "vision",
+      imageBuffer: f.buffer,
+      mime,
+      detectedText: null,
+      cuisine: null,
+      mealType: null,
+      userPreferences: prefs,
+    });
+    
+    // Vision returns wrapper
+    const { itemName, scoringJson } = out as any;
+    
+
+    console.log("Router itemName", itemName);
+
+    return res.json(
+      apiOk(req, {
+        itemName, // ✅ from wrapper
+        scoring: {
+          score: scoringJson.score,
+          label: scoringJson.label,
+          why: scoringJson.why,
+          reasons: scoringJson.reasons,
+          flags: scoringJson.flags,
+        },
+        scoringJson,
+      })
+    );
+    
+  } catch (e) {
+    const r = apiErr(req, "SYNC_VISION_SCORE_FAILED", "Could not score photo.", "Try again.", 500, true);
+    return res.status(r.status).json({ ...r.body, debug: { message: (e as Error)?.message ?? "unknown" } });
+  }
+};
 
 
 const syncScanScoreHandler = async (req: any, res: any) => {
@@ -185,6 +240,7 @@ const syncScanScoreHandler = async (req: any, res: any) => {
         scoring: {
           score: scoringJson.score,
           label: scoringJson.label,
+          why: scoringJson.why,          // <-- ADD THIS LINE
           reasons: scoringJson.reasons,
           flags: scoringJson.flags,
         },
@@ -206,3 +262,5 @@ const syncScanScoreHandler = async (req: any, res: any) => {
  */
 syncScanRouter.post("/score-v1", requireSyncMode(), syncScanScoreHandler);
 syncScanRouter.post("/score", requireSyncMode(), syncScanScoreHandler);
+syncScanRouter.post(  "/score-vision-v1",  requireSyncMode(),  upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),  syncScanVisionScoreHandler);
+

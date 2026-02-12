@@ -17,6 +17,7 @@ import { CameraView, useCameraPermissions } from "expo-camera";
 import { useLocalSearchParams } from "expo-router";
 import { UI } from "../../theme/ui";
 import { useModeGate } from "../../hooks/use-mode-gate";
+import { apiPostForm } from "../../api/client";
 import { createMealLog, scoreMealInputPreview, scanOcr } from "../../api/meal-scoring";
 import type { MealInput } from "../../contracts/meal-input";
 import { invalidateHomeSummary } from "../../hooks/use-home-summary";
@@ -71,6 +72,48 @@ function PrimaryButton(props: {
     </View>
   );
 }
+
+
+async function scoreVisionV1(fileUri: string, _mode: "sync" | "privacy") {
+  const form = new FormData();
+  form.append("file", {
+    uri: fileUri,
+    name: "scan.jpg",
+    type: "image/jpeg",
+  } as any);
+
+  const result = await apiPostForm<{ data?: any }>("/v1/sync/scan/score-vision-v1", form);
+  return result?.data ?? result;
+}
+
+
+function isLikelyOcrGarbage(s: string) {
+  const t = (s ?? "").trim();
+  if (!t) return true;
+
+  // Too long and low word quality is usually OCR junk
+  const letters = (t.match(/[A-Za-z]/g) ?? []).length;
+  const total = t.length;
+  const alphaRatio = total > 0 ? letters / total : 0;
+
+  const words = t.split(/\s+/).filter(Boolean);
+  const longWords = words.filter(w => w.length >= 3);
+
+  // Heuristics tuned for “random OCR”
+  if (t.length > 120 && alphaRatio < 0.55) return true;
+  if (t.length > 80 && longWords.length < 3) return true;
+  if (alphaRatio < 0.35) return true;
+
+  return false;
+}
+
+function cleanLogSummary(raw: string, mode: "sync" | "privacy") {
+  const t = (raw ?? "").trim();
+  if (mode === "sync" && isLikelyOcrGarbage(t)) return "Food scan (photo)";
+  return t;
+}
+
+
 
 export default function FoodScanScreen() {
   const params = useLocalSearchParams<{ mealType?: string; start?: string }>();
@@ -134,6 +177,9 @@ const [scanning, setScanning] = useState(false);
     return "Tip: In private mode, type a short description (e.g., “gatorade”, “chicken salad”, “2 tacos”).";
   }, [mode, ready]);
 
+
+  
+
   async function onScanPhoto() {
       if (!ready) return;
     
@@ -182,16 +228,20 @@ if (ocrResp?.meta?.blocked) {
           setInlineError("Couldn’t read text from that photo. Try again with better lighting.");
           return;
         }
-    
+
+         // In Sync (Vision-first): do NOT populate Type box.
         // populate text field for user to edit
+        if (mode !== "sync") {
         setItemsText(text.trim());
+      }
+      
     
         // (recommended) auto-run preview
         // IMPORTANT: your onPreview reads itemsText, so call it after state updates.
         // simplest: call with direct string by temporarily setting local state:
         // We'll just defer one tick:
         setTimeout(() => {
-          onPreview();
+          onPreview(uri);
         }, 0);
       } catch (e: any) {
         setInlineError(e?.message ?? "Scan failed. Try again.");
@@ -200,25 +250,51 @@ if (ocrResp?.meta?.blocked) {
       }
   }
 
-  async function onPreview() {
+  async function onPreview(photoUri?: string) {
     const text = String(itemsText ?? "").trim();
-    if (!text) {
-      setInlineError("Type what you ate.");
-      return;
-    }
   
     setInlineError(null);
     setPreview(null);
     setPreviewLoading(true);
   
     try {
-      const res = await scoreV1(
-        { context: "food_scan", input: { text } },
-        { mode }
-      );
-      console.log("preview keys:", Object.keys(res.data ?? {}));
+      if (mode === "sync" && photoUri) {
+        // 1) VISION FIRST
+        const data = await scoreVisionV1(photoUri, mode);
+  
+        if (!data?.scoringJson) {
+          setInlineError("AI response missing scoring details. Please try again.");
+          return;
+        }
+  
+        setPreview(data);
+        console.log("Food-Scan onPreview itemName", data?.itemName);
+        console.log("Food-Scan onPreview score", data?.scoringJson?.score);
+        return;
+      }
+  
+      // 2) TEXT SECONDARY (fallback)
+      if (!text) {
+        setInlineError(mode === "sync" ? "Take a photo (Vision-first), or type what you ate." : "Type what you ate.");
+        return;
+      }
+  
+      const res = await scoreV1({ context: "food_scan", input: { text } }, { mode });
+      const data = res?.data ?? null;
+  
+      if (mode === "sync" && !data?.scoringJson) {
+        setInlineError("AI response missing scoring details. Please try again.");
+        return;
+      }
+      if (mode !== "sync" && !data?.scoring) {
+        setInlineError("Preview unavailable right now.");
+        return;
+      }
+  
+      setPreview(data);
 
-      setPreview(res.data);
+
+
     } catch (e: any) {
       setInlineError(e?.message ?? "Couldn't preview right now.");
     } finally {
@@ -226,26 +302,47 @@ if (ocrResp?.meta?.blocked) {
     }
   }
   
+  
+  
 
   async function onSave() {
-    const text = itemsText.trim();
-    if (text.length < 2) {
-      Alert.alert("Save log", "Type what you ate first.");
-      return;
-    }
+
+const rawText = itemsText.trim();
+const text = cleanLogSummary(rawText, mode);
+
+if (text.length < 2) {
+  Alert.alert(
+    "Save log",
+    mode === "sync"
+      ? "Take a photo and preview score first (Vision-first), or type what you ate."
+      : "Type what you ate first."
+  );
+  return;
+}
+
   
-    if (!preview?.scoring) {
-      Alert.alert("Save log", "Preview score first, then save.");
-      return;
+    // Capture once so TS can narrow reliably
+    const p = preview;
+  
+    // Guard by mode (Sync requires scoringJson; Privacy requires scoring)
+    if (mode === "sync") {
+      if (!p?.scoringJson) {
+        Alert.alert("Save log", "Preview score first, then save.");
+        return;
+      }
+    } else {
+      if (!p?.scoring) {
+        Alert.alert("Save log", "Preview score first, then save.");
+        return;
+      }
     }
   
     setSaving(true);
     setInlineError(null);
   
     try {
-      const derivedMealType = preview?.scoring?.derived?.mealType ?? null;
+      const derivedMealType = p?.scoring?.derived?.mealType ?? null;
       const mealType = mealTypeOverride ?? derivedMealType ?? null;
-
   
       if (mode === "privacy") {
         // 🔐 LOCAL SAVE
@@ -254,7 +351,7 @@ if (ocrResp?.meta?.blocked) {
           summary: text,
           mealType,
           source: "food_scan",
-          scoring: preview.scoring,
+          scoring: p!.scoring, // safe due to guard above
         });
   
         invalidateHomeSummary(); // local ring refresh
@@ -263,17 +360,24 @@ if (ocrResp?.meta?.blocked) {
       }
   
       // ☁️ SYNC MODE (existing behavior)
-      const scoringJson = preview?.scoringJson ?? null;
-      const score = preview?.scoring?.score ?? null;
-      
-      if (mode === "sync" && !scoringJson) {
-        Alert.alert("Save log", "Missing AI scoring details. Please preview score again.");
-        return;
-      }
-      
+      const scoringJson = p!.scoringJson; // safe due to guard above
+      const score = scoringJson?.score ?? null; // ✅ canonical
+      const itemName = (preview as any)?.itemName ?? null;
+
+
+      console.log("Food-Scan itemName", itemName);
+      console.log("Food-Scan score", score);
+
+
+      const safeSummary =
+        mode === "sync"
+        ? (itemName || "Food scan (photo)")
+        : text;
+
+  
       const out = await createMealLog(
         {
-          summary: text,
+          summary: safeSummary,
           capturedAt: new Date().toISOString(),
           mealType,
           score,
@@ -281,7 +385,6 @@ if (ocrResp?.meta?.blocked) {
         },
         { mode }
       );
-      
   
       if ("logId" in out) {
         invalidateHomeSummary();
@@ -295,6 +398,7 @@ if (ocrResp?.meta?.blocked) {
       setSaving(false);
     }
   }
+  
 
   if (!ready) {
     return (
@@ -303,6 +407,20 @@ if (ocrResp?.meta?.blocked) {
       </View>
     );
   }
+
+
+  const pj = preview?.scoringJson ?? null; // canonical
+  const ps = preview?.scoring ?? null;     // privacy/summary
+  const previewScore = mode === "sync" ? pj?.score : ps?.score;
+  const previewLabel = mode === "sync" ? pj?.label : ps?.label;
+  const previewWhy = mode === "sync" ? pj?.why : null;
+  const previewReasons = mode === "sync" ? pj?.reasons : ps?.reasons;
+  const previewFlags = mode === "sync" ? pj?.flags : ps?.flags;
+  
+
+
+
+
 
   return (
     <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
@@ -417,7 +535,7 @@ if (ocrResp?.meta?.blocked) {
           <PrimaryButton
             title={saving ? "Saving…" : "Save log"}
             onPress={onSave}
-            disabled={busy || saving || !preview?.scoring}
+            disabled={busy || saving || (mode === "sync" ? !preview?.scoringJson : !preview?.scoring)}
             tone="secondary"
             style={{ flex: 1 }}
           />
@@ -427,30 +545,40 @@ if (ocrResp?.meta?.blocked) {
 
 
 
-        {preview?.scoring ? (
-          <View style={[styles.card, { marginTop: 12 }]}>
-            <Text style={styles.sectionTitle}>Preview</Text>
-            <Text style={styles.bigScore}>{preview.scoring.score}</Text>
+        {(mode === "sync" ? !!pj : !!ps) ? (
+  <View style={[styles.card, { marginTop: 12 }]}>
+    <Text style={styles.sectionTitle}>Preview</Text>
 
-            {Array.isArray(preview.scoring.reasons) && preview.scoring.reasons.length > 0 ? (
-              <View style={{ marginTop: UI.spacing.gapSm }}>
-                {normalizeReasons(preview.scoring.reasons, { context: "food", max: 5 }).map((r: string, i: number) => (
-                  <Text key={i} style={styles.reason}>
-                    • {r}
-                  </Text>
-                ))}
-              </View>
-            ) : (
-              <Text style={styles.tip}>No explanation yet.</Text>
-            )}
+    <Text style={styles.bigScore}>{previewScore ?? "—"}</Text>
+    {!!previewLabel ? <Text style={styles.previewLabel}>{previewLabel}</Text> : null}
 
-            {mode !== "sync" ? (
-              <Text style={styles.tip}>Turn on Sync for richer explanations + continuity (encrypted).</Text>
-            ) : (
-              <Text style={styles.tip}>Sync is on — more consistent results as preferences + history build up.</Text>
-            )}
-          </View>
-        ) : null}
+    {mode === "sync" && !!previewWhy ? (
+      <Text style={styles.previewWhy}>{previewWhy}</Text>
+    ) : null}
+
+    {Array.isArray(previewReasons) && previewReasons.length > 0 ? (
+      <View style={{ marginTop: UI.spacing.gapSm }}>
+        {normalizeReasons(previewReasons, { context: "food", max: 5 }).map((r: string, i: number) => (
+          <Text key={i} style={styles.reason}>• {r}</Text>
+        ))}
+      </View>
+    ) : (
+      <Text style={styles.tip}>No explanation yet.</Text>
+    )}
+
+    {Array.isArray(previewFlags) && previewFlags.length > 0 ? (
+      <Text style={styles.tip}>Flags: {previewFlags.join(", ")}</Text>
+    ) : null}
+
+    {mode !== "sync" ? (
+      <Text style={styles.tip}>Turn on Sync for richer explanations + continuity (encrypted).</Text>
+    ) : (
+      <Text style={styles.tip}>Sync is on — explanations are saved per-log (encrypted).</Text>
+    )}
+  </View>
+) : null}
+
+
 
         <View style={{ height: 24 }} />
       </ScrollView>
@@ -530,4 +658,10 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     textAlign: "center",
   },
+
+  previewLabel: { color: UI.colors.textDim, fontWeight: "800", marginTop: 4 },
+  previewWhy: { color: UI.colors.text, marginTop: UI.spacing.gapSm, lineHeight: 18 },
+  
+
+
 });

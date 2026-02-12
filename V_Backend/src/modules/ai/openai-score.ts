@@ -1,4 +1,5 @@
 // src/modules/ai/openai-score.ts
+import { z } from "zod";
 import { AiScoringSchema, type AiScoring } from "../scoring";
 
 type ScoreSource = "menu" | "scan";
@@ -11,11 +12,51 @@ type CommonArgs = {
   model?: string; // optional override
 };
 
+export type AiVisionScoreResult = {
+  itemName: string;
+  scoringJson: AiScoring;
+};
+
+
+
+
 /**
  * Public canonical entrypoint.
  * Routers should ONLY import and call this.
  */
+
+
 export async function openAiScoreOneItem(
+  args: CommonArgs & {
+    mode: "text";
+    itemName: string;
+    ingredients?: string | null;
+  }
+): Promise<AiScoring>;
+
+export async function openAiScoreOneItem(
+  args: CommonArgs & {
+    mode: "vision";
+    imageBuffer: Buffer;
+    mime: string;
+    detectedText?: string | null;
+  }
+): Promise<AiVisionScoreResult>;
+
+
+
+export async function openAiScoreOneItem(
+  args:
+    | (CommonArgs & { mode: "text"; itemName: string; ingredients?: string | null })
+    | (CommonArgs & { mode: "vision"; imageBuffer: Buffer; mime: string; detectedText?: string | null })
+): Promise<AiScoring | AiVisionScoreResult> {
+  if (args.mode === "vision") {
+    return scoreVisionOne(args);
+  }
+  return scoreTextOne(args);
+}
+
+/*export async function openAiScoreOneItem(
   args:
     | (CommonArgs & {
         mode: "text";
@@ -28,12 +69,15 @@ export async function openAiScoreOneItem(
         mime: string;
         detectedText?: string | null; // OCR text if available
       })
-): Promise<AiScoring> {
-  if (args.mode === "vision") {
-    return scoreVisionOne(args);
-  }
-  return scoreTextOne(args);
-}
+    
+      | (CommonArgs & { mode: "text"; itemName: string; ingredients?: string | null })
+      | (CommonArgs & { mode: "vision"; imageBuffer: Buffer; mime: string; detectedText?: string | null })
+  ): Promise<AiScoring | AiVisionScoreResult> {
+    if (args.mode === "vision") {
+      return scoreVisionOne(args); // will return AiVisionScoreResult
+    }
+    return scoreTextOne(args); // returns AiScoring
+  }*/
 
 /**
  * Batch helper for menu scoring (text list -> scoring per item).
@@ -45,6 +89,7 @@ export async function openAiScoreManyText(args: CommonArgs & { items: Array<{ na
     const name = String(it?.name ?? "").trim();
     if (!name) continue;
 
+    
     const scoringJson = await openAiScoreOneItem({
       source: args.source,
       mode: "text",
@@ -87,7 +132,7 @@ async function scoreTextOne(args: CommonArgs & { mode: "text"; itemName: string;
 
 async function scoreVisionOne(
   args: CommonArgs & { mode: "vision"; imageBuffer: Buffer; mime: string; detectedText?: string | null }
-): Promise<AiScoring> {
+): Promise<AiVisionScoreResult> {
   const apiKey = requireOpenAIKey();
   const model = args.model ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
 
@@ -110,9 +155,41 @@ async function scoreVisionOne(
     maxOutputTokens: 1200,
   });
 
-  // ✅ Enforce canonical contract
-  return AiScoringSchema.parse(json);
+
+  const VisionWrapperSchema = z.object({
+    itemName: z.string().min(1).max(50),
+
+    scoringJson: AiScoringSchema,
+  });
+  
+
+  // ✅ Enforce: Vision returns wrapper { itemName, scoringJson }, and scoringJson is canonical
+  const validated = VisionWrapperSchema.parse(json);
+
+  // Normalize itemName a bit (keep it short, no punctuation-heavy sentences)
+  const itemName = String(validated.itemName)
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.?!,:;]+$/g, "")
+    .slice(0, 50);
+
+
+   /* let s = validated.scoringJson.score;
+
+    // If model returns 0–10, upscale (8 => 80)
+    if (typeof s === "number" && s >= 0 && s <= 10) {
+      s = Math.round(s * 10);
+    }
+    
+    // Clamp to 0–100
+    s = Math.max(0, Math.min(100, Math.round(s)));
+    
+    const scoringJson = { ...validated.scoringJson, score: s };*/
+
+
+  return { itemName, scoringJson: validated.scoringJson };
 }
+
 
 /* -----------------------
  * Prompt builders
@@ -193,34 +270,39 @@ Task:
 - Identify the most likely single food item shown (or described by detectedText).
 - Score it for the user's health goal and preferences.
 
-Return STRICT JSON only with EXACT keys:
+Return JSON only in this exact format:
+
 {
-  "score": number (0-100),
-  "label": "Good" | "Ok" | "Not Preferred",
-  "why": string (1-2 sentences, plain English),
-  "reasons": string[] (2-3 short bullets),
-  "flags": string[] (0-8 items),
-  "nutritionNotes": string|null,
-  "estimates": {
-    "calories": number|null,
-    "protein_g": number|null,
-    "carbs_g": number|null,
-    "fat_g": number|null,
-    "sugar_g": number|null,
-    "sodium_mg": number|null
-  },
-  "features": {
-    "cuisineMatch": "high"|"medium"|"low",
-    "goalAlignment": "high"|"medium"|"low",
-    "healthRisk": "low"|"medium"|"high",
-    "satiety": "low"|"medium"|"high"
+  "itemName": "<2-4 word food name>",
+  "scoringJson": {
+    "score": number (0-100),
+    "label":"Good" | "Ok" | "Not Preferred",
+    "why": "1–2 sentence explanation",
+    "reasons": ["short bullet", "..."],
+    "flags": string[] (0-8 items),
+    "nutritionNotes": string|null,
+    "estimates": {
+      "calories": number | null,
+      "protein_g": number | null,
+      "carbs_g": number | null,
+      "fat_g": number | null,
+      "sugar_g": number | null,
+      "sodium_mg": number | null
+    },
+    "features": {
+      "cuisineMatch": "high|medium|low",
+      "goalAlignment": "high|medium|low",
+      "healthRisk": "low|medium|high",
+      "satiety": "low|medium|high"
+    }
   }
 }
 
 Rules:
-- Output JSON ONLY (no markdown, no extra text)
-- If uncertain about what the item is, prefer label "Ok", lower score, and keep estimates null
-- Do not invent ingredients
+- itemName must be concise (2–4 words).
+- Do NOT include explanations in itemName.
+- scoringJson must strictly follow schema.
+- Return JSON only.
 `.trim();
 }
 
