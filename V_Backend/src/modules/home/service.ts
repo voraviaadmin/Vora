@@ -7,6 +7,26 @@ import {
   type Behavior14Day,
 } from "../../intelligence/engine";
 import { computeTodayTotals, compute14DayBehavior } from "../logs/service";
+// If your crypto export name differs, change this import accordingly.
+import { decryptProfile } from "../profile/crypto";
+
+
+function readUserPrefsSyncOnly(db: any, userId: string): any | null {
+  const row = db
+    .prepare(`SELECT encryptedJson FROM user_profile_preferences_secure WHERE userId=?`)
+    .get(userId) as { encryptedJson?: string } | undefined;
+
+  if (!row?.encryptedJson) return null;
+
+  try {
+    // decryptProfile should return the plain prefs object
+    const prefs = decryptProfile(row.encryptedJson);
+    return prefs && typeof prefs === "object" ? prefs : null;
+  } catch {
+    return null;
+  }
+}
+
 
 
 type HomeWindow = "daily" | "3d" | "7d" | "14d";
@@ -127,13 +147,27 @@ async function generateDishIdeasAI(input: {
   cuisineHint?: string | null;
   recentSummaries: string[];
   modeLabel: "sync";
+  aiPersonality?: "straight" | "encouraging" | "coach"; // ✅ NEW
 }): Promise<{ ideas: DishIdea[]; searchKey: string } | null> {
   // non-medical, concise JSON output
+
+  const tone =
+  input.aiPersonality === "straight"
+    ? "Write in a direct, no-fluff tone. Keep it short."
+    : input.aiPersonality === "encouraging"
+    ? "Write in a warm, encouraging tone. Be positive and motivating."
+    : input.aiPersonality === "coach"
+    ? "Write in a coach-like tone with 2–3 action steps."
+    : "Write in a warm, encouraging tone. Keep it concise.";
+
+
+
   const prompt = {
     timeWindow: input.timeWindow,
     guidanceBullets: input.bullets,
     cuisineHint: input.cuisineHint ?? null,
     recentLogs: input.recentSummaries.slice(0, 10),
+    tone, // ✅ NEW (the model will follow this)
     constraints: {
       count: 3,
       style: "premium, simple, non-medical, no numbers, restaurant-search friendly",
@@ -292,15 +326,31 @@ function num(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return await Promise.race([
-    p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error("AI_TIMEOUT")), ms)
-    ),
-  ]);
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); })
+     .catch((e) => { clearTimeout(t); reject(e); });
+  });
 }
 
+function clamp01(n: any) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
+}
+
+
+// IMPORTANT: request-scoped single-call guard (backend safety)
+function getHomeAiGuard(req: Request) {
+  const anyReq = req as any;
+  if (typeof anyReq.__homeAiUsed !== "boolean") anyReq.__homeAiUsed = false;
+  return {
+    used: () => Boolean(anyReq.__homeAiUsed),
+    mark: () => { anyReq.__homeAiUsed = true; }
+  };
+}
 
 export async function getHomeSummary(
   req: Request,
@@ -324,9 +374,9 @@ export async function getHomeSummary(
   const syncOn = isSyncEnabled(db, ctx.userId);
   const syncMode = syncOn ? "sync" : "privacy";
 
-  // TODO: wire real prefs later
-  const userPrefs = null;
-  const localIntelOrNull = null;
+  const userPrefs = syncOn ? readUserPrefsSyncOnly(db, ctx.userId) : null;
+  const localIntelOrNull = null; // keep local-only for now (frontend supplies later)
+
 
   // ---- Window query (your existing logic)
   const now = new Date();
@@ -399,6 +449,7 @@ export async function getHomeSummary(
     mode: syncMode,
     preferences: syncOn ? userPrefs : null,
     intel: localIntelOrNull,
+
   });
 
   const todayTotals = opts.window === "daily" ? computeTodayTotals(rows) : null;
@@ -422,29 +473,35 @@ export async function getHomeSummary(
       : null;
 
 
-      let dishIdeas: DishIdea[] | null = null;
-      let restaurantSearchKey: string | null = null;
-      
-      if (opts.window === "daily" && syncOn && bestNextMeal) {
-        // Build recent summaries (use normalized or rows14d, keep it short)
-        const recentSummaries = normalized
-          .slice(0, 10)
-          .map((x: any) => String(x.summary ?? "").trim())
+  // ---- AI dish ideas (Sync-only, daily-only, never blocks Home)
+  let dishIdeas: DishIdea[] | null = null;
+  let restaurantSearchKey: string | null = null;
+
+  if (opts.window === "daily" && syncOn && bestNextMeal) {
+    const guard = getHomeAiGuard(req);
+
+    // 1 call max per request (even if refactors call twice)
+    if (!guard.used()) {
+      guard.mark();
+
+      const apiKey = process.env.OPENAI_API_KEY || "";
+      const model = process.env.OPENAI_MODEL_HOME_IDEAS || "gpt-4o-mini";
+
+      // If no key, skip silently (Home must never break)
+      if (apiKey) {
+        const timeWindow = "next meal";
+        const bullets = Array.isArray((bestNextMeal as any)?.meta?.bullets)
+          ? (bestNextMeal as any).meta.bullets.slice(0, 6)
+          : [];
+
+        // Light personalization from last logs
+        const recentSummaries = rows
+          .map((r: any) => (typeof r?.summary === "string" ? r.summary : ""))
           .filter(Boolean)
-          .slice(0, 10);
-      
-        // Use engine meta if available
-        const timeWindow = bestNextMeal.meta?.timeWindow ?? "meal";
-        const bullets = Array.isArray(bestNextMeal.meta?.bullets) ? bestNextMeal.meta.bullets : [];
-      
-        const apiKey = process.env.OPENAI_API_KEY || "";
-        const model = process.env.OPENAI_MODEL_HOME_IDEAS || "gpt-4o-mini";
-      
-        if (apiKey && !anyReq.__homeAiUsed) {
-          anyReq.__homeAiUsed = true; // 🔒 hard guarantee
-          console.log("[HOME_AI] generating dish ideas");
-        
-          const aiOut = await withTimeout(
+          .slice(0, 8);
+
+        try {
+          const aiRaw = await withTimeout(
             generateDishIdeasAI({
               apiKey,
               model,
@@ -453,20 +510,23 @@ export async function getHomeSummary(
               cuisineHint: behavior14d?.commonCuisine ?? null,
               recentSummaries,
               modeLabel: "sync",
+              aiPersonality: userPrefs?.aiPersonality ?? "straight",
             }),
-            1600
-          ).catch(() => null);
-        
-          if (aiOut) {
-            dishIdeas = aiOut.ideas;
-            restaurantSearchKey = aiOut.searchKey;
+            1600 // hard cap: tune to taste
+          );
+
+          const sanitized = sanitizeIdeas(aiRaw);
+          if (sanitized) {
+            dishIdeas = sanitized.ideas;
+            restaurantSearchKey = sanitized.searchKey;
           }
+        } catch {
+          // swallow: Home must never block
         }
-        
-
-
-
       }
+    }
+  }
+
       
       // fallback (still premium) if AI fails
       if (opts.window === "daily" && !dishIdeas && bestNextMeal) {
@@ -499,21 +559,41 @@ export async function getHomeSummary(
       totals: todayTotals,
     };
 
-    suggestion = bestNextMeal
-    ? {
-        title: bestNextMeal.title,
-        suggestionText: bestNextMeal.suggestionText,
-        contextNote: bestNextMeal.contextNote ?? null,
-        restaurantQuery: null,
-  
-        // ✅ NEW
-        ideas: dishIdeas ?? [],
-        route: {
-          tab: "eatout",
-          searchKey: restaurantSearchKey ?? "",
-        },
-      }
-    : null;
+
+
+    const countedRowsToday =
+    opts.window === "daily"
+      ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length
+      : 0;
+
+  const totalRowsToday = opts.window === "daily" ? rows.length : 0;
+
+  const estimateCoverage =
+    totalRowsToday > 0 ? countedRowsToday / totalRowsToday : 0;
+
+  const behaviorConfidence = behavior14d ? 1 : 0;
+  const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
+
+
+  const confidenceLabel =
+  suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
+
+suggestion = bestNextMeal
+  ? {
+      title: bestNextMeal.title,
+      suggestionText: bestNextMeal.suggestionText,
+      contextNote: bestNextMeal.contextNote ?? null,
+
+      confidence: suggestionConfidence,       // 0..1
+      confidenceLabel,                        // "low" | "medium" | "high"
+      dishIdeas: dishIdeas ?? [],
+
+      route: {
+        tab: "eat-out",                        // IMPORTANT: match frontend
+        searchKey: restaurantSearchKey ?? "",
+      },
+    }
+  : null;
   }
 
   return {

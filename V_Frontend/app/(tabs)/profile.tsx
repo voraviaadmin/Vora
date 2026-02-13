@@ -35,6 +35,8 @@ type Preferences = {
   };
   goal: "lose" | "maintain" | "gain";
   cuisines: string[];
+  // ✅ Sync-only: changes wording only (no medical claims)
+  aiPersonality?: AiPersonality;
 };
 
 type CuisineCatalogItem = { id: string; label: string; aliases?: string[] };
@@ -45,6 +47,8 @@ type ActivityLevel = "sedentary" | "moderate" | "active";
 type ProteinPreference = "low" | "medium" | "high";
 type EatingStyle = "home" | "balanced" | "eatout";
 type PortionAppetite = "small" | "average" | "large";
+type AiPersonality = "straight" | "encouraging" | "coach";
+
 
 type ProfileIntel = {
   goalIntensity?: GoalIntensity;
@@ -56,6 +60,7 @@ type ProfileIntel = {
   wakeTime?: string; // "07:30"
   mealsPerDay?: 2 | 3 | 4 | 5;
   dinnerTime?: string; // "19:30"
+  aiPersonality?: AiPersonality;
 };
 
 const LOCAL_INTEL_KEY = "voravia.profileIntel.v1";
@@ -64,6 +69,7 @@ const defaultPrefs: Preferences = {
   health: { diabetes: false, highBP: false, fattyLiver: false },
   goal: "maintain",
   cuisines: [],
+  aiPersonality: "straight",
 };
 
 const defaultIntel: ProfileIntel = {
@@ -76,6 +82,7 @@ const defaultIntel: ProfileIntel = {
   wakeTime: undefined,
   mealsPerDay: undefined,
   dinnerTime: undefined,
+  aiPersonality: "straight",
 };
 
 function ConfirmModal({
@@ -176,8 +183,8 @@ export default function ProfileTab() {
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
 
   // Accordion: only one open at a time
-  type SectionKey = "goals" | "health" | "taste" | "habits";
-  const [open, setOpen] = useState<SectionKey>("goals");
+  type SectionKey = "aiPersonality" | "goals" | "health" | "taste" | "habits";
+  const [open, setOpen] = useState<SectionKey>("aiPersonality");
 
   const copy = useMemo(
     () => ({
@@ -220,6 +227,8 @@ export default function ProfileTab() {
       disableNote: "Disabling Sync deletes server-stored data and removes you from all groups.",
 
       // Sections
+      aiPersonalityTitle: "AI Personality",
+      aiPersonalitySub: "Tone of suggestions",
       goalsTitle: "Goals",
       healthTitle: "Health",
       tasteTitle: "Taste",
@@ -445,7 +454,11 @@ export default function ProfileTab() {
       health: { ...prefs.health },
       goal: prefs.goal,
       cuisines: [...prefs.cuisines],
+      // ✅ include it in the saved server payload
+      aiPersonality: prefs.aiPersonality ?? "straight",
     };
+
+
 
     const nextIntel: ProfileIntel = {
       ...intel,
@@ -578,12 +591,36 @@ export default function ProfileTab() {
   return (
     <View style={styles.screen}>
       <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+
         <View style={styles.section}>
           <Text style={styles.h1}>{copy.headerTitle}</Text>
-          <Text style={styles.sub}>
-            {isSync ? "Sync is on for personalization + groups." : "Privacy mode is on (on-device)."}
+
+          <View style={styles.rowBetween}>
+            <Text style={styles.sub}>
+              {isSync ? "Sync Mode" : "Privacy Mode"}
+            </Text>
+
+            <Switch
+              value={isSync}
+              disabled={!modeReady}
+              trackColor={{ false: UI.colors.outline, true: accent }}
+              thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
+              ios_backgroundColor={UI.colors.outline}
+              onValueChange={(v) => {
+                if (!modeReady) return;
+                if (v) setShowEnableConfirm(true);
+                else setShowDisableConfirm(true);
+              }}
+            />
+          </View>
+
+          <Text style={[styles.muted, { fontSize: 12 }]}>
+            {isSync
+              ? "Personalized insights + groups."
+              : "All data stays on this device."}
           </Text>
         </View>
+
 
         {toast ? <ToastInline kind={toast.kind} msg={toast.msg} /> : null}
 
@@ -594,6 +631,35 @@ export default function ProfileTab() {
           {!isSync ? <Text style={styles.note}>{copy.privacyNote}</Text> : null}
 
           <View style={{ marginTop: UI.spacing.sectionGapSm, gap: UI.spacing.sectionGapSm }}>
+
+            {/* ===== AI Personality Section START ===== */}
+            {isSync && (
+              <AccordionCard k="aiPersonality" title={copy.aiPersonalityTitle}>
+                <Text style={styles.label}>{copy.aiPersonalitySub}</Text>
+                <View style={styles.pillRow}>
+
+                  <Pill
+                    label="Straight"
+                    selected={intel.aiPersonality === "straight"}
+                    onPress={() => setIntel((p) => ({ ...p, aiPersonality: "straight" }))}
+                  />
+                  <Pill
+                    label="Encouraging"
+                    selected={intel.aiPersonality === "encouraging"}
+                    onPress={() => setIntel((p) => ({ ...p, aiPersonality: "encouraging" }))}
+                  />
+                  <Pill
+                    label="Coach-like"
+                    selected={intel.aiPersonality === "coach"}
+                    onPress={() => setIntel((p) => ({ ...p, aiPersonality: "coach" }))}
+                  />
+                </View>
+              </AccordionCard>
+            )}
+            {/* ===== AI Personality Section END ===== */}
+
+
+
             <AccordionCard k="goals" title={copy.goalsTitle}>
               <Text style={styles.label}>{copy.goalLabel}</Text>
               <View style={styles.pillRow}>
@@ -897,108 +963,22 @@ export default function ProfileTab() {
         </View>
 
         {/* Privacy & Sync */}
+
+        {/* ===== About Privacy & Sync START ===== */}
         <View style={styles.card}>
-          <View style={styles.rowBetween}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.h2}>{copy.modeTitle}</Text>
-              <Text style={styles.sub}>{copy.modeSub}</Text>
-            </View>
-
-            <View style={[styles.switchWrap, !modeReady && { opacity: 0.5 }]}>
-              <Text style={styles.switchLabel}>
-                {!modeReady ? "Starting…" : isSync ? "Sync" : "Privacy"}
-              </Text>
-
-              <Switch
-                value={isSync}
-                disabled={!modeReady}
-                trackColor={{ false: UI.colors.outline, true: accent }}
-                thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
-                ios_backgroundColor={UI.colors.outline}
-                onValueChange={(v) => {
-                  if (!modeReady) return;
-                  if (v) setShowEnableConfirm(true);
-                  else setShowDisableConfirm(true);
-                }}
-              />
-            </View>
-          </View>
-
-          <View style={styles.block}>
-            <Text style={styles.strong}>{copy.privacyTitle}</Text>
-            <Text style={styles.muted}>{copy.privacyBody}</Text>
-            <View style={{ marginTop: UI.spacing.gapSm }}>
-              {copy.privacyBullets.map((b) => (
-                <View key={b} style={styles.bulletRow}>
-                  <Text style={styles.bullet}>•</Text>
-                  <Text style={styles.bulletText}>{b}</Text>
-                </View>
-              ))}
-            </View>
-          </View>
-
-          <View style={styles.block}>
-            <Text style={styles.strong}>{copy.syncTitle}</Text>
-            <Text style={styles.muted}>{copy.syncBody}</Text>
-            <View style={{ marginTop: UI.spacing.gapSm }}>
-              {copy.syncBullets.map((b) => (
-                <View key={b} style={styles.bulletRow}>
-                  <Text style={styles.bullet}>•</Text>
-                  <Text style={styles.bulletText}>{b}</Text>
-                </View>
-              ))}
-            </View>
-          </View>
-
-          <View style={styles.divider} />
-
-          {!isSync ? (
-            <View style={styles.block}>
-              <Text style={styles.strong}>{copy.syncOffTitle}</Text>
-              <Text style={styles.muted}>{copy.syncOffSub}</Text>
-
-              <Pressable style={[styles.btn, styles.btnPrimary]} onPress={() => setShowEnableConfirm(true)}>
-                <Text style={styles.btnPrimaryText}>{copy.enableSyncBtn}</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <View style={styles.block}>
-              <Text style={styles.strong}>{copy.syncOnTitle}</Text>
-              <Text style={styles.muted}>{copy.syncOnSub}</Text>
-
-              <Text style={styles.note}>{copy.disableNote}</Text>
-
-              <Pressable style={[styles.btn, styles.btnDangerOutline]} onPress={() => setShowDisableConfirm(true)}>
-                <Text style={styles.btnDangerText}>{copy.disableSyncBtn}</Text>
-              </Pressable>
-            </View>
-          )}
+          <Text style={styles.h2}>About Privacy & Sync</Text>
+          <Text style={[styles.muted, { fontSize: 12 }]}>
+            • Sync stores goal, health toggles and cuisines
+            • Habits stay on this device
+            • You can switch anytime
+          </Text>
         </View>
+        {/* ===== About Privacy & Sync END ===== */}
 
-        {/* What we store (Sync only) */}
-        <View style={styles.card}>
-          <Text style={styles.h2}>{copy.whatStoreTitle}</Text>
-          <Text style={styles.sub}>{copy.whatStoreSub}</Text>
-
-          <View style={{ marginTop: UI.spacing.gapSm }}>
-            {copy.whatStoreBullets.map((b) => (
-              <View key={b} style={styles.bulletRow}>
-                <Text style={styles.bullet}>•</Text>
-                <Text style={styles.bulletText}>{b}</Text>
-              </View>
-            ))}
-          </View>
-
-          <Text style={styles.note}>{copy.noAgeGender}</Text>
-        </View>
-
-        {loading ? (
-          <View style={styles.loadingRow}>
-            <ActivityIndicator />
-            <Text style={styles.muted}>Loading…</Text>
-          </View>
-        ) : null}
       </ScrollView>
+
+
+
 
       <ConfirmModal
         visible={showEnableConfirm}
@@ -1021,6 +1001,8 @@ export default function ProfileTab() {
         onConfirm={disableSync}
         busy={disableBusy}
       />
+
+
     </View>
   );
 }

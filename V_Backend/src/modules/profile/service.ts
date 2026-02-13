@@ -121,17 +121,63 @@ function assertPreferencesShape(prefs: any) {
   // Optional fields (frontend can ignore them; backend can store them)
   const cuisineIds = Array.isArray(prefs.cuisineIds)
     ? prefs.cuisineIds
-        .map((x: any) => (typeof x === "string" ? x.trim() : ""))
-        .filter(Boolean)
-        .slice(0, 50)
+      .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 50)
     : undefined;
 
   const customCuisines = Array.isArray(prefs.customCuisines)
     ? prefs.customCuisines
-        .map((x: any) => (typeof x === "string" ? x.trim() : ""))
-        .filter(Boolean)
-        .slice(0, 50)
+      .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 50)
     : undefined;
+
+
+
+  // Optional additions (safe, non-breaking)
+  const avoidFoods = Array.isArray(prefs.avoidFoods)
+    ? prefs.avoidFoods
+      .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 30)
+    : undefined;
+
+  const preferFoods = Array.isArray(prefs.preferFoods)
+    ? prefs.preferFoods
+      .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 30)
+    : undefined;
+
+  const allergens = Array.isArray(prefs.allergens)
+    ? prefs.allergens
+      .map((x: any) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 20)
+    : undefined;
+
+  const budgetTier =
+    prefs.budgetTier === "low" || prefs.budgetTier === "medium" || prefs.budgetTier === "high"
+      ? prefs.budgetTier
+      : undefined;
+
+  const restaurantStrategy =
+    prefs.restaurantStrategy === "health_first" ||
+      prefs.restaurantStrategy === "balanced" ||
+      prefs.restaurantStrategy === "enjoy_first"
+      ? prefs.restaurantStrategy
+      : undefined;
+
+
+  const aiPersonality =
+    prefs.aiPersonality === "straight" ||
+      prefs.aiPersonality === "encouraging" ||
+      prefs.aiPersonality === "coach"
+      ? prefs.aiPersonality
+      : undefined;
+
+
 
   return {
     health: { diabetes, highBP, fattyLiver },
@@ -139,6 +185,14 @@ function assertPreferencesShape(prefs: any) {
     cuisines: cleanedCuisines,
     cuisineIds,
     customCuisines,
+    aiPersonality,
+
+    // NEW (optional)
+    avoidFoods,
+    preferFoods,
+    allergens,
+    budgetTier,
+    restaurantStrategy,
   };
 }
 
@@ -157,11 +211,11 @@ export function getProfile(req: Request) {
     .prepare("SELECT mode FROM profile_settings WHERE userId=?")
     .get(ctx.userId);
 
-    const isSync = settings?.mode === "sync";
+  const isSync = settings?.mode === "sync";
 
-    if (!isSync) {
-      return { syncEnabled: false };
-    }
+  if (!isSync) {
+    return { syncEnabled: false };
+  }
 
   const row = db
     .prepare("SELECT encryptedJson FROM user_profile_secure WHERE userId=?")
@@ -238,9 +292,9 @@ export function saveProfile(req: Request, body: any) {
     .prepare("SELECT mode FROM profile_settings WHERE userId=?")
     .get(ctx.userId);
 
-    if (settings?.mode !== "sync") {
-      throw new Error("SYNC_DISABLED");
-    }
+  if (settings?.mode !== "sync") {
+    throw new Error("SYNC_DISABLED");
+  }
   const encrypted = encryptProfile(body);
 
   db.prepare(`
@@ -360,8 +414,19 @@ export function saveProfilePreferences(req: Request, body: any) {
     health: prefs.health,
     goal: prefs.goal,
     cuisines: prefs.cuisines, // keep UI display list as-is
-    cuisineIds: derivedCuisineIds,
-  customCuisines: derivedCustoms,
+
+    // IMPORTANT: convert Set to array
+    cuisineIds: Array.from(derivedCuisineIds),
+    customCuisines: derivedCustoms,
+
+    aiPersonality: prefs.aiPersonality,
+
+    // NEW optional fields carried through
+    avoidFoods: prefs.avoidFoods,
+    preferFoods: prefs.preferFoods,
+    allergens: prefs.allergens,
+    budgetTier: prefs.budgetTier,
+    restaurantStrategy: prefs.restaurantStrategy,
   };
 
 
