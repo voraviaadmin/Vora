@@ -1,5 +1,13 @@
 import type { Request } from "express";
 import { getCtx, getDb } from "../logs/service";
+import {
+  buildProfileSummary,
+  buildDailyVector2,
+  getBestNextMealV2,
+  type Behavior14Day,
+} from "../../intelligence/engine";
+import { computeTodayTotals, compute14DayBehavior } from "../logs/service";
+
 
 type HomeWindow = "daily" | "3d" | "7d" | "14d";
 
@@ -55,33 +63,284 @@ function statusForScore(score: number, hasData: boolean) {
   return { statusWord: "Steady", description: "A protein + fiber combo can help next." };
 }
 
-export function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: number }) {
+function safeJsonParse(v: any): any | null {
+  if (!v) return null;
+  if (typeof v === "object") return v;
+  if (typeof v === "string") {
+    try { return JSON.parse(v); } catch { return null; }
+  }
+  return null;
+}
+
+function getEstimatesFromRow(r: any): any | null {
+  const sj = safeJsonParse(r?.scoringJson);
+  const e = sj?.estimates;
+  return e && typeof e === "object" ? e : null;
+}
+
+function hasAnyNumericEstimate(e: any): boolean {
+  if (!e) return false;
+  const keys = ["calories","protein_g","carbs_g","fat_g","sugar_g","sodium_mg","fiber_g"];
+  return keys.some(k => Number.isFinite(Number(e[k])));
+}
+
+type DishIdea = {
+  title: string;
+  query: string;
+  cuisineHint?: string | null;
+  tags?: string[];
+};
+
+function clampStr(s: any, max: number) {
+  const v = typeof s === "string" ? s.trim() : "";
+  return v.length > max ? v.slice(0, max) : v;
+}
+
+function sanitizeIdeas(raw: any): { ideas: DishIdea[]; searchKey: string } | null {
+  const ideasRaw = raw?.ideas;
+  const searchKeyRaw = raw?.searchKey;
+
+  if (!Array.isArray(ideasRaw)) return null;
+
+  const ideas: DishIdea[] = ideasRaw
+    .slice(0, 3)
+    .map((x: any) => ({
+      title: clampStr(x?.title, 60),
+      query: clampStr(x?.query, 80) || clampStr(x?.title, 80),
+      cuisineHint: x?.cuisineHint ? clampStr(x.cuisineHint, 30) : null,
+      tags: Array.isArray(x?.tags) ? x.tags.slice(0, 2).map((t: any) => clampStr(t, 18)).filter(Boolean) : [],
+    }))
+    .filter((i) => i.title && i.query);
+
+  const searchKey = clampStr(searchKeyRaw, 80);
+
+  if (ideas.length !== 3) return null;
+
+  return { ideas, searchKey: searchKey || ideas[0].query };
+}
+
+async function generateDishIdeasAI(input: {
+  apiKey: string;
+  model: string;
+  timeWindow: string;
+  bullets: string[];
+  cuisineHint?: string | null;
+  recentSummaries: string[];
+  modeLabel: "sync";
+}): Promise<{ ideas: DishIdea[]; searchKey: string } | null> {
+  // non-medical, concise JSON output
+  const prompt = {
+    timeWindow: input.timeWindow,
+    guidanceBullets: input.bullets,
+    cuisineHint: input.cuisineHint ?? null,
+    recentLogs: input.recentSummaries.slice(0, 10),
+    constraints: {
+      count: 3,
+      style: "premium, simple, non-medical, no numbers, restaurant-search friendly",
+      output: "JSON only",
+    },
+  };
+
+  const controller = new AbortController();
+const t = setTimeout(() => controller.abort(), 1400); // 1.4s hard stop (tune)
+
+
+try {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${input.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: input.model,
+      temperature: 0.6,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You generate 3 personalized dish ideas for a nutrition app. " +
+            "Be non-medical, concise, and restaurant-search friendly. " +
+            "Output MUST be valid JSON with keys: { searchKey: string, ideas: [{title, query, cuisineHint?, tags?}] }. " +
+            "No extra keys, no commentary.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(prompt),
+        },
+      ],
+    }),
+  }
+);
+
+  if (!res.ok) return null;
+
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content;
+  const parsed = safeJsonParse(text);
+  return sanitizeIdeas(parsed);
+} catch (e) {
+  return null; // NEVER block Home
+} finally {
+  clearTimeout(t);
+}
+}
+
+type TodayTotals = {
+  calories: number;
+  protein_g: number;
+  sugar_g: number;
+  sodium_mg: number;
+  fiber_g: number;
+};
+
+function computeTodayTotalsFromRows(rows: any[]): TodayTotals {
+  // NOTE: implement using r.summary if it contains nutrients; otherwise return zeros safely
+  const totals: TodayTotals = { calories: 0, protein_g: 0, sugar_g: 0, sodium_mg: 0, fiber_g: 0 };
+
+  for (const r of rows) {
+    const s = safeParseSummary(r.summary);
+    if (!s) continue;
+
+    // if summary stores these keys
+    totals.calories += num(s.calories);
+    totals.protein_g += num(s.protein_g ?? s.protein);
+    totals.sugar_g += num(s.sugar_g ?? s.sugar);
+    totals.sodium_mg += num(s.sodium_mg ?? s.sodium);
+    totals.fiber_g += num(s.fiber_g ?? s.fiber);
+  }
+
+  return totals;
+}
+
+function computeBehavior14dFromRows(rows: any[], targets?: { sodium_mg_max?: number; protein_g?: number }): Behavior14Day {
+  // Minimal safe defaults; you can refine once nutrients schema is confirmed
+  const days = new Map<string, { sodium: number; protein: number; calories: number; sugar: number; fiber: number; cuisines: Record<string, number> }>();
+
+  for (const r of rows) {
+    const dayKey = (r.capturedAt ?? "").slice(0, 10); // YYYY-MM-DD
+    if (!dayKey) continue;
+
+    const s = safeParseSummary(r.summary);
+    if (!s) continue;
+
+    const entry = days.get(dayKey) ?? { sodium: 0, protein: 0, calories: 0, sugar: 0, fiber: 0, cuisines: {} };
+
+    entry.calories += num(s.calories);
+    entry.protein += num(s.protein_g ?? s.protein);
+    entry.sodium += num(s.sodium_mg ?? s.sodium);
+    entry.sugar += num(s.sugar_g ?? s.sugar);
+    entry.fiber += num(s.fiber_g ?? s.fiber);
+
+    const cuisine = typeof s.cuisine === "string" ? s.cuisine.trim() : "";
+    if (cuisine) entry.cuisines[cuisine] = (entry.cuisines[cuisine] ?? 0) + 1;
+
+    days.set(dayKey, entry);
+  }
+
+  const dayEntries = Array.from(days.values());
+  const n = Math.max(1, dayEntries.length);
+
+  const avgCalories = Math.round(dayEntries.reduce((a, d) => a + d.calories, 0) / n);
+  const avgProtein_g = Math.round(dayEntries.reduce((a, d) => a + d.protein, 0) / n);
+  const avgSodium_mg = Math.round(dayEntries.reduce((a, d) => a + d.sodium, 0) / n);
+  const avgSugar_g = Math.round(dayEntries.reduce((a, d) => a + d.sugar, 0) / n);
+  const avgFiber_g = Math.round(dayEntries.reduce((a, d) => a + d.fiber, 0) / n);
+
+  const sodiumMax = targets?.sodium_mg_max ?? 2300;
+  const proteinTarget = targets?.protein_g ?? 110;
+
+  const highSodiumDays = dayEntries.filter((d) => d.sodium >= sodiumMax).length;
+  const lowProteinDays = dayEntries.filter((d) => d.protein <= Math.max(0, proteinTarget * 0.8)).length;
+
+  // Common cuisine (simple most-frequent)
+  const cuisineCounts: Record<string, number> = {};
+  for (const d of dayEntries) {
+    for (const [c, cnt] of Object.entries(d.cuisines)) cuisineCounts[c] = (cuisineCounts[c] ?? 0) + cnt;
+  }
+  const commonCuisine =
+    Object.entries(cuisineCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+
+  return {
+    avgCalories,
+    avgProtein_g,
+    avgSodium_mg,
+    avgSugar_g,
+    avgFiber_g,
+    highSodiumDaysPct: n ? highSodiumDays / n : 0,
+    lowProteinDaysPct: n ? lowProteinDays / n : 0,
+    commonCuisine,
+  };
+}
+
+function safeParseSummary(summary: any): any | null {
+  if (!summary) return null;
+  if (typeof summary === "object") return summary;
+  if (typeof summary === "string") {
+    try {
+      return JSON.parse(summary);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function num(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return await Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error("AI_TIMEOUT")), ms)
+    ),
+  ]);
+}
+
+
+export async function getHomeSummary(
+  req: Request,
+  opts: { window: HomeWindow; limit: number }
+) {
   const ctx = getCtx(req);
   const db = getDb(req);
 
-  // ✅ Member-scoped (activeMemberId), with allowed-member enforcement
   const subjectMemberId = ctx.activeMemberId;
   if (!ctx.allowedMemberIds.includes(subjectMemberId)) {
     throw new Error("MEMBER_NOT_ALLOWED");
   }
 
+  const anyReq = req as any;
+  anyReq.__homeAiUsed = anyReq.__homeAiUsed ?? false;
+  
+
+
+
+  // ---- Mode (compute once)
+  const syncOn = isSyncEnabled(db, ctx.userId);
+  const syncMode = syncOn ? "sync" : "privacy";
+
+  // TODO: wire real prefs later
+  const userPrefs = null;
+  const localIntelOrNull = null;
+
+  // ---- Window query (your existing logic)
   const now = new Date();
   const toIso = now.toISOString();
+
   const fromIso =
     opts.window === "daily"
       ? startOfLocalDayIso(now)
       : new Date(now.getTime() - daysForWindow(opts.window) * 24 * 60 * 60 * 1000).toISOString();
 
-  // Pull enough rows to compute stable averages even if logs are messy
   const rows = db
     .prepare(
       `
-      SELECT
-        logId,
-        mealType,
-        capturedAt,
-        score,
-        summary
+      SELECT logId, mealType, capturedAt, score, summary, scoringJson
       FROM logs
       WHERE subjectMemberId = ?
         AND deletedAt IS NULL
@@ -93,6 +352,7 @@ export function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: 
     )
     .all(subjectMemberId, fromIso, toIso);
 
+  // ---- Normalize + compute hero score (NO intelligence in here)
   const scores: number[] = [];
   const normalized = rows.map((r: any) => {
     const s = clampScore(r.score);
@@ -109,45 +369,158 @@ export function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: 
 
   const hasData = scores.length > 0;
   const avgScore = hasData ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
-
-  const syncOn = isSyncEnabled(db, ctx.userId);
-  const syncMode = syncOn ? "sync" : "privacy";
-
   const status = statusForScore(avgScore, hasData);
 
-  // v1 focus + suggestion: mode-aware placeholders (safe even with messy logs)
-  // Later: plug in nutrition totals + next-meal engine here (no Home UI changes).
-  const todaysFocus =
-    opts.window === "daily"
-      ? {
-          title: "Today’s Focus",
-          chips: [
-            { key: "protein", label: "Protein", valueText: "—" },
-            { key: "fiber", label: "Fiber", valueText: "—" },
-            { key: "sugar", label: "Sugar", valueText: "—" },
-          ],
-          totals: null as any,
-        }
+  // ---- 14d behavior query (ALWAYS 14d; run ONCE)
+  const fromIso14d = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  const rows14d = db
+    .prepare(
+      `
+      SELECT capturedAt, summary, scoringJson
+      FROM logs
+      WHERE subjectMemberId = ?
+        AND deletedAt IS NULL
+        AND capturedAt >= ?
+        AND capturedAt <= ?
+      ORDER BY capturedAt DESC
+      LIMIT 800
+      `
+    )
+    .all(subjectMemberId, fromIso14d, toIso);
+
+  const behavior14d = compute14DayBehavior(rows14d); // <-- from 14d rows ONLY
+
+
+  
+
+  // ---- Daily-only intelligence
+  const profileSummary = buildProfileSummary({
+    mode: syncMode,
+    preferences: syncOn ? userPrefs : null,
+    intel: localIntelOrNull,
+  });
+
+  const todayTotals = opts.window === "daily" ? computeTodayTotals(rows) : null;
+
+  const vector =
+    opts.window === "daily" && todayTotals
+      ? buildDailyVector2({
+          profile: profileSummary,
+          consumed: todayTotals,
+          behavior14d,
+        })
       : null;
 
-  const suggestion =
-    opts.window === "daily"
-      ? {
-          title: "Best next meal",
-          suggestionText: syncOn
-            ? "A protein-forward meal with fiber would balance today well."
-            : "A balanced meal with protein + fiber is a good next step.",
-          contextNote: syncOn ? "Based on your preferences and recent logs." : "Enable Sync for deeper personalization.",
-          restaurantQuery: null as any,
-        }
+  const bestNextMeal =
+    opts.window === "daily" && vector
+      ? getBestNextMealV2({
+          profile: profileSummary,
+          vector,
+          behavior14d,
+        })
       : null;
+
+
+      let dishIdeas: DishIdea[] | null = null;
+      let restaurantSearchKey: string | null = null;
+      
+      if (opts.window === "daily" && syncOn && bestNextMeal) {
+        // Build recent summaries (use normalized or rows14d, keep it short)
+        const recentSummaries = normalized
+          .slice(0, 10)
+          .map((x: any) => String(x.summary ?? "").trim())
+          .filter(Boolean)
+          .slice(0, 10);
+      
+        // Use engine meta if available
+        const timeWindow = bestNextMeal.meta?.timeWindow ?? "meal";
+        const bullets = Array.isArray(bestNextMeal.meta?.bullets) ? bestNextMeal.meta.bullets : [];
+      
+        const apiKey = process.env.OPENAI_API_KEY || "";
+        const model = process.env.OPENAI_MODEL_HOME_IDEAS || "gpt-4o-mini";
+      
+        if (apiKey && !anyReq.__homeAiUsed) {
+          anyReq.__homeAiUsed = true; // 🔒 hard guarantee
+          console.log("[HOME_AI] generating dish ideas");
+        
+          const aiOut = await withTimeout(
+            generateDishIdeasAI({
+              apiKey,
+              model,
+              timeWindow,
+              bullets,
+              cuisineHint: behavior14d?.commonCuisine ?? null,
+              recentSummaries,
+              modeLabel: "sync",
+            }),
+            1600
+          ).catch(() => null);
+        
+          if (aiOut) {
+            dishIdeas = aiOut.ideas;
+            restaurantSearchKey = aiOut.searchKey;
+          }
+        }
+        
+
+
+
+      }
+      
+      // fallback (still premium) if AI fails
+      if (opts.window === "daily" && !dishIdeas && bestNextMeal) {
+        dishIdeas = [
+          { title: "Grilled chicken bowl", query: "grilled chicken bowl", tags: ["Build"] },
+          { title: "Greek salad + chicken", query: "greek chicken chicken salad", tags: ["Build"] },
+          { title: "Salmon + veggies", query: "salmon vegetables", tags: ["Great"] },
+        ];
+        restaurantSearchKey = dishIdeas[0].query;
+      }
+      
+
+
+
+
+
+
+
+  // ---- Home payload fields
+  let todaysFocus: any = null;
+  let suggestion: any = null;
+
+  if (opts.window === "daily" && vector && todayTotals) {
+    todaysFocus = {
+      title: "Today’s Focus",
+      chips: [
+        { key: "deficit", label: "Deficit", valueText: vector.deficitOfDay?.text ?? "—" },
+        { key: "risk", label: "Risk", valueText: vector.overRisk?.text ?? "—" },
+      ],
+      totals: todayTotals,
+    };
+
+    suggestion = bestNextMeal
+    ? {
+        title: bestNextMeal.title,
+        suggestionText: bestNextMeal.suggestionText,
+        contextNote: bestNextMeal.contextNote ?? null,
+        restaurantQuery: null,
+  
+        // ✅ NEW
+        ideas: dishIdeas ?? [],
+        route: {
+          tab: "eatout",
+          searchKey: restaurantSearchKey ?? "",
+        },
+      }
+    : null;
+  }
 
   return {
     meta: {
       window: opts.window,
       generatedAt: new Date().toISOString(),
       syncMode,
-      // Home UI can still read /v1/me for display mode; keeping stable + safe here
       mode: "individual",
       subjectMemberId,
     },
@@ -169,10 +542,17 @@ export function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: 
       primaryCta: { id: "scan_food", title: "Scan Food", subtitle: null },
       secondaryCta: { id: "find_restaurant", title: "Find Restaurant", subtitle: null },
     },
+
+    // ✅ return the object (premium UI)
     todaysFocus,
+
+    // ✅ only present for daily
+    todayTotals,
+
     suggestion,
     recentLogs: {
       items: normalized.slice(0, opts.limit),
     },
   };
 }
+

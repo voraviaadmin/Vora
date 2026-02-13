@@ -123,74 +123,74 @@ export default function LogsTab() {
 
   const [selected, setSelected] = useState<LogRow | null>(null);
   const [scorePreview, setScorePreview] = useState<ScorePreview | null>(null);
-const [scorePreviewLoading, setScorePreviewLoading] = useState(false);
-const todayAvg = trend?.daily?.[trend.daily.length - 1]?.avgScore ?? null;
-const ydayAvg = trend?.daily?.[trend.daily.length - 2]?.avgScore ?? null;
+  const [scorePreviewLoading, setScorePreviewLoading] = useState(false);
+  const todayAvg = trend?.daily?.[trend.daily.length - 1]?.avgScore ?? null;
+  const ydayAvg = trend?.daily?.[trend.daily.length - 2]?.avgScore ?? null;
 
 
-// IMPORTANT:
-// Logs screen is source-aware.
-// - privacy → local-logs
-// - sync → backend
+  // IMPORTANT:
+  // Logs screen is source-aware.
+  // - privacy → local-logs
+  // - sync → backend
 
-const { mode, ready } = useModeGate();
+  const { mode, ready } = useModeGate();
 
-const loadAll = useCallback(
-  async (opts?: { silent?: boolean }) => {
-    const silent = opts?.silent ?? false;
-    if (!silent) setLoading(true);
-    setError(null);
+  const loadAll = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent ?? false;
+      if (!silent) setLoading(true);
+      setError(null);
 
-    try {
-      // ✅ PRIVACY: local logs only (no backend)
-      if (mode === "privacy") {
-        const all = await getLocalLogs();
+      try {
+        // ✅ PRIVACY: local logs only (no backend)
+        if (mode === "privacy") {
+          const all = await getLocalLogs();
 
-        // Map LocalLog -> whatever your LogRow expects.
-        // If your UI only needs summary/capturedAt/score, this is enough.
-        const rows = all
-          .slice()
-          .sort((a, b) => (b.capturedAt || "").localeCompare(a.capturedAt || ""))
-          .map((l) => ({
-            id: l.id,
-            capturedAt: l.capturedAt,
-            summary: l.summary,
-            score: l.scoring?.score ?? 0,
-            scoring: l.scoring,
-          })) as any;
+          // Map LocalLog -> whatever your LogRow expects.
+          // If your UI only needs summary/capturedAt/score, this is enough.
+          const rows = all
+            .slice()
+            .sort((a, b) => (b.capturedAt || "").localeCompare(a.capturedAt || ""))
+            .map((l) => ({
+              id: l.id,
+              capturedAt: l.capturedAt,
+              summary: l.summary,
+              score: l.scoring?.score ?? 0,
+              scoring: l.scoring,
+            })) as any;
 
-        setLogs(rows);
+          setLogs(rows);
 
-        // Optional: if your Trend UI supports null, keep it null in privacy for now:
-        setTrend(null);
+          // Optional: if your Trend UI supports null, keep it null in privacy for now:
+          setTrend(null);
 
-        return;
+          return;
+        }
+
+        // ✅ SYNC: existing behavior
+        const logsRes = await apiJson<{ logs: LogRow[] }>(`/v1/logs?limit=100`);
+        setLogs(logsRes.logs ?? []);
+
+        const mc = await apiJson<{ trend: Trend }>(
+          `/v1/profile/meal-context?days=${days}&limit=0`
+        );
+        setTrend(mc.trend ?? null);
+      } catch (e: any) {
+        setError(e?.message ?? "Network request failed");
+      } finally {
+        if (!silent) setLoading(false);
       }
-
-      // ✅ SYNC: existing behavior
-      const logsRes = await apiJson<{ logs: LogRow[] }>(`/v1/logs?limit=100`);
-      setLogs(logsRes.logs ?? []);
-
-      const mc = await apiJson<{ trend: Trend }>(
-        `/v1/profile/meal-context?days=${days}&limit=0`
-      );
-      setTrend(mc.trend ?? null);
-    } catch (e: any) {
-      setError(e?.message ?? "Network request failed");
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  },
-  [days, mode]
-);
+    },
+    [days, mode]
+  );
 
   async function openLog(l: LogRow) {
     setSelected(l);
     setScorePreview(null);
-  
+
     // Sync mode stored explanation → no need to fetch fallback
     if (l.scoring) return;
-  
+
     setScorePreviewLoading(true);
     try {
       const sp = await apiJson<ScorePreview>("/v1/profile/score-preview");
@@ -199,7 +199,7 @@ const loadAll = useCallback(
       setScorePreviewLoading(false);
     }
   }
-  
+
 
 
   useEffect(() => {
@@ -236,12 +236,13 @@ const loadAll = useCallback(
       })}
     </View>
   );
-  
+
   const explanation = selected?.scoring ?? scorePreview?.scoring ?? null;
   const explanationSource: "per-log" | "fallback" | "none" =
     selected?.scoring ? "per-log" : scorePreview?.scoring ? "fallback" : "none";
-  
 
+  const safeToday = Number.isFinite(todayAvg) ? todayAvg : 0;
+  const safeYday = Number.isFinite(ydayAvg) ? ydayAvg : 0;
 
   return (
     <ScrollView
@@ -265,23 +266,25 @@ const loadAll = useCallback(
         ) : trend ? (
           <>
             <View style={styles.kpiRow}>
-              
-            <View style={{ flex: 1 }}>
-              
-            <Kpi
-              label="Avg"
-              value={trend.avgScore}
-              footer={
-                <>
-                  <ScoreDelta today={todayAvg} yesterday={ydayAvg} />
-                  <AIPill confidence={null} />
-                </>
-              }
-            />
+
+              <View style={{ flex: 1 }}>
+
+                <Kpi
+                  label="Avg"
+                  value={trend.avgScore}
+                  footer={
+                    <>
+
+
+                      <ScoreDelta today={safeToday} yesterday={safeYday} />
+                      <AIPill confidence={0} />
+                    </>
+                  }
+                />
 
 
 
-            </View>
+              </View>
 
               <Kpi label="Best" value={trend.bestScore} />
               <Kpi label="Worst" value={trend.worstScore} />
@@ -320,10 +323,10 @@ const loadAll = useCallback(
           <Text style={styles.muted}>No logs yet.</Text>
         ) : (
           <View style={{ marginTop: UI.spacing.gapSm }}>
-            
+
             {sortedLogs.map((l) => (
               <LogRowItem
-              key={l.logId ?? `${l.createdAt}-${l.summary ?? "log"}`}
+                key={l.logId ?? `${l.createdAt}-${l.summary ?? "log"}`}
                 item={{
                   title: l.summary?.trim() ? l.summary.trim() : "Log",
                   subtitle: `${formatIso(l.capturedAt)} • ${l.mealType ?? "—"}`,
@@ -341,7 +344,7 @@ const loadAll = useCallback(
         )}
       </Card>
 
-<ModalCard
+      <ModalCard
         visible={!!selected}
         title="Log details"
         onClose={() => {
@@ -358,7 +361,7 @@ const loadAll = useCallback(
 
         {explanation ? (
 
-            <ScoringPanel
+          <ScoringPanel
             explained={explanationSource === "per-log" && (Boolean(explanation?.why) || (explanation?.reasons?.length ?? 0) > 0)}
             scoring={{
               score: explanation.score,
@@ -366,26 +369,26 @@ const loadAll = useCallback(
               signals: {
                 label: explanation.label,
                 why: explanation.why,
-                flags: explanation.flags ?? [], 
+                flags: explanation.flags ?? [],
                 nutritionNotes: explanation.nutritionNotes ?? null,
                 estimates: explanation.estimates ?? null,
                 features: explanation.features ?? null,
               },
             }}
-            />
+          />
 
 
-          ) : scorePreviewLoading ? (
-            <View style={{ flexDirection: "row", alignItems: "center", gap: UI.spacing.gap }}>
-              <ActivityIndicator />
-              <Text style={{ color: UI.colors.textDim }}>Loading explanation…</Text>
-            </View>
-          ) : null}
+        ) : scorePreviewLoading ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: UI.spacing.gap }}>
+            <ActivityIndicator />
+            <Text style={{ color: UI.colors.textDim }}>Loading explanation…</Text>
+          </View>
+        ) : null}
 
 
 
 
-</ModalCard>
+      </ModalCard>
 
 
       <View style={{ height: UI.spacing.sectionGap * 2 }} />
@@ -408,7 +411,7 @@ const styles = StyleSheet.create({
   kpiRow: { flexDirection: "row", gap: UI.spacing.gap, marginTop: UI.spacing.sectionGap },
 
 
- 
+
   dayBtn: {
     paddingVertical: 6,
     paddingHorizontal: 10,
@@ -421,12 +424,12 @@ const styles = StyleSheet.create({
   dayText: { color: "rgba(255,255,255,0.8)", fontWeight: "700" },
   dayTextActive: { color: UI.colors.text },
 
- /* modalBackdrop: {
-    flex: 1,
-    backgroundColor: UI.colors.modalBackdrop,
-    padding: UI.spacing.page,
-    justifyContent: "center",
-  }, */
+  /* modalBackdrop: {
+     flex: 1,
+     backgroundColor: UI.colors.modalBackdrop,
+     padding: UI.spacing.page,
+     justifyContent: "center",
+   }, */
   modalCard: {
     backgroundColor: UI.colors.modalCard,
     borderRadius: UI.radius.card,
@@ -434,7 +437,7 @@ const styles = StyleSheet.create({
     borderWidth: UI.border.thin,
     borderColor: UI.colors.modalBorder,
   },
-  
+
   /*modalTitle: { color: UI.colors.text, fontSize: UI.type.cardTitle, fontWeight: "900", marginBottom: 10 },
   modalRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: UI.spacing.gapSm },
   modalLabel: { color: UI.colors.textDim, fontWeight: "800" },

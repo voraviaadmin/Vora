@@ -4,6 +4,8 @@ import { writeAuditEvent } from "../../audit/audit";
 import { buildMealContext } from "../profile/mealContext";
 import { scoreMealContext } from "../../utils/scoring";
 import { safeParseAiScoring, stringifyAiScoring } from "../scoring";
+//import type { DailyConsumed } from "../../intelligence/engine";
+//import type { Behavior14Day } from "../../intelligence/engine";
 
 
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
@@ -27,6 +29,139 @@ export function getDb(req: Request) {
   if (!db) throw new Error("DB_MISSING");
   return db;
 }
+
+type DailyConsumed = {
+  calories: number;
+  protein_g: number;
+  sugar_g: number;
+  sodium_mg: number;
+  fiber_g: number;
+};
+
+type Behavior14Day = {
+  avgCalories: number;
+  avgProtein_g: number;
+  avgSodium_mg: number;
+  avgSugar_g: number;
+  avgFiber_g: number;
+
+  highSodiumDaysPct: number; // 0..1
+  lowProteinDaysPct: number; // 0..1
+
+  commonCuisine?: string | null;
+  lateEatingPct?: number;
+};
+
+
+
+
+
+function safeJsonParse(v: any): any | null {
+  if (!v) return null;
+  if (typeof v === "object") return v;
+  if (typeof v === "string") {
+    try { return JSON.parse(v); } catch { return null; }
+  }
+  return null;
+}
+
+function getEstimates(scoringJson: unknown): any | null {
+  const sj = safeJsonParse(scoringJson);
+  const e = sj?.estimates;
+  return e && typeof e === "object" ? e : null;
+}
+
+
+function num(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Aggregate today's nutrition from log rows (scoringJson.estimates). Returns zeros if no data. */
+export function computeTodayTotals(
+  rows: Array<{ capturedAt?: string | null; scoringJson?: unknown }>
+): DailyConsumed {
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayStartIso = todayStart.toISOString();
+  const tomorrowStartIso = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000).toISOString();
+
+  let calories = 0, protein_g = 0, sugar_g = 0, sodium_mg = 0, fiber_g = 0;
+
+  for (const r of rows) {
+    const at = r.capturedAt;
+    if (!at || at < todayStartIso || at >= tomorrowStartIso) continue;
+
+    const e = getEstimates(r.scoringJson);
+    if (!e) continue;
+
+    calories += num(e.calories);
+    protein_g += num(e.protein_g);
+    sugar_g += num(e.sugar_g);
+    sodium_mg += num(e.sodium_mg);
+    fiber_g += num(e.fiber_g);
+  }
+
+  return { calories, protein_g, sugar_g, sodium_mg, fiber_g };
+}
+
+/** Build 14-day behavior summary from log rows. */
+export function compute14DayBehavior(
+  rows: Array<{ capturedAt?: string | null; scoringJson?: unknown }>,
+  opts?: { sodiumMax_mg?: number; proteinTarget_g?: number }
+): Behavior14Day | null {
+  if (!rows.length) return null;
+
+  const sodiumMax = opts?.sodiumMax_mg ?? 2300;
+  const proteinTarget = opts?.proteinTarget_g ?? 110;
+  const lowProteinCutoff = proteinTarget * 0.8;
+
+  // per-day totals (YYYY-MM-DD)
+  const perDay = new Map<string, { cal: number; pro: number; sod: number; sug: number; fib: number }>();
+
+  let sumCal = 0, sumPro = 0, sumSod = 0, sumSug = 0, sumFib = 0;
+  let nLogs = 0;
+
+  for (const r of rows.slice(0, 800)) {
+    if (!r.capturedAt) continue;
+    const e = getEstimates(r.scoringJson);
+    if (!e) continue;
+
+    const cal = num(e.calories);
+    const pro = num(e.protein_g);
+    const sod = num(e.sodium_mg);
+    const sug = num(e.sugar_g);
+    const fib = num(e.fiber_g);
+
+    sumCal += cal; sumPro += pro; sumSod += sod; sumSug += sug; sumFib += fib;
+    nLogs++;
+
+    const dayKey = r.capturedAt.slice(0, 10);
+    const d = perDay.get(dayKey) ?? { cal: 0, pro: 0, sod: 0, sug: 0, fib: 0 };
+    d.cal += cal; d.pro += pro; d.sod += sod; d.sug += sug; d.fib += fib;
+    perDay.set(dayKey, d);
+  }
+
+  if (nLogs < 3) return null;
+
+  const days = Array.from(perDay.values());
+  const nDays = days.length;
+
+  const highSodiumDays = days.filter(d => d.sod >= sodiumMax).length;
+  const lowProteinDays = days.filter(d => d.pro <= lowProteinCutoff).length;
+
+  return {
+    avgCalories: Math.round(sumCal / nLogs),
+    avgProtein_g: Math.round((sumPro / nLogs) * 10) / 10,
+    avgSodium_mg: Math.round(sumSod / nLogs),
+    avgSugar_g: Math.round((sumSug / nLogs) * 10) / 10,
+    avgFiber_g: Math.round((sumFib / nLogs) * 10) / 10,
+    highSodiumDaysPct: nDays ? highSodiumDays / nDays : 0,
+    lowProteinDaysPct: nDays ? lowProteinDays / nDays : 0,
+  };
+}
+
 
 function assertString(val: any, field: string, maxLen: number, optional = true) {
   if (val == null || val === "") {

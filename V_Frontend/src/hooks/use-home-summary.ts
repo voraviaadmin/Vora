@@ -177,6 +177,10 @@ export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5):
   const [error, setError] = useState<string | null>(null);
 
   const aliveRef = useRef(true);
+  const inFlightRef = useRef<CacheKey | null>(null);
+
+
+
   useEffect(() => {
     aliveRef.current = true;
     return () => {
@@ -186,6 +190,15 @@ export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5):
 
   const fetchOnce = useCallback(
     async (loadMode: "load" | "refresh") => {
+
+// ✅ prevent double-fetch when initial load + focus fire close together
+if (inFlightRef.current === cacheKey) {
+  console.log("[HOME] double-fetch prevented", cacheKey);
+  return;
+}
+inFlightRef.current = cacheKey;
+
+
       try {
         if (loadMode === "load") setLoading(true);
         if (loadMode === "refresh") setRefreshing(true);
@@ -213,6 +226,7 @@ export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5):
         setError(normalizeErr(e));
       } finally {
         if (!aliveRef.current) return;
+        if (inFlightRef.current === cacheKey) inFlightRef.current = null;
         setLoading(false);
         setRefreshing(false);
       }
@@ -235,7 +249,7 @@ export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5):
   useFocusEffect(
     useCallback(() => {
       // don’t “hard refresh” every time if we already have data; but do refresh if empty
-      if (!CACHE.has(cacheKey)) {
+      if (!CACHE.has(cacheKey) && !data) {
         fetchOnce("load");
       }
       return () => {};

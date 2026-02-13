@@ -22,13 +22,20 @@ export function homeRouter() {
   const r = Router();
 
   // GET /v1/home/summary?window=daily|3d|7d|14d&limit=5
-  r.get("/summary", (req, res) => {
-    const window = normalizeWindow(req.query.window);
-    const limit = parseLimit(req.query.limit);
+  r.get("/summary", async (req, res, next) => {
+    try {
+      const window = normalizeWindow(req.query.window);
+      const limit = parseLimit(req.query.limit);
+  
+      //console.log("[HOME] req", req.method, req.originalUrl);
 
-    const out = getHomeSummary(req, { window, limit });
-    res.json(out);
+      const out = await getHomeSummary(req, { window, limit });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
   });
+  
 
   return r;
 }
