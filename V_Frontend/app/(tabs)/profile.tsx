@@ -13,18 +13,18 @@ import {
   View,
   TouchableWithoutFeedback,
 } from "react-native";
-import { Picker } from "@react-native-picker/picker";
-import { apiJson } from "../../lib/api";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+import { apiJson } from "../../src/api/client";
 import { UI } from "../../src/theme/ui";
 import { useMode } from "../../src/state/mode";
 import { toUserMessage } from "../../src/utils/toast-copy";
-import { apiPost, ApiError } from "../../src/api/client"; // adjust path
+import { apiPost } from "../../src/api/client";
 import { getApiBaseUrl } from "../../src/api/base";
 
 console.log("Profile Tab: [boot] api base", getApiBaseUrl());
 
 type ToastKind = "success" | "error";
-
 type ProfileMode = "privacy" | "sync";
 
 type Preferences = {
@@ -37,14 +37,45 @@ type Preferences = {
   cuisines: string[];
 };
 
-type ProfileResponse = {
-  mode: ProfileMode;
+type CuisineCatalogItem = { id: string; label: string; aliases?: string[] };
+
+// Local-only intelligence layer (safe, optional, on-device only)
+type GoalIntensity = "light" | "moderate" | "aggressive";
+type ActivityLevel = "sedentary" | "moderate" | "active";
+type ProteinPreference = "low" | "medium" | "high";
+type EatingStyle = "home" | "balanced" | "eatout";
+type PortionAppetite = "small" | "average" | "large";
+
+type ProfileIntel = {
+  goalIntensity?: GoalIntensity;
+  activityLevel?: ActivityLevel;
+  proteinPreference?: ProteinPreference;
+  carbSensitive?: boolean;
+  eatingStyle?: EatingStyle;
+  portionAppetite?: PortionAppetite;
+  wakeTime?: string; // "07:30"
+  mealsPerDay?: 2 | 3 | 4 | 5;
+  dinnerTime?: string; // "19:30"
 };
+
+const LOCAL_INTEL_KEY = "voravia.profileIntel.v1";
 
 const defaultPrefs: Preferences = {
   health: { diabetes: false, highBP: false, fattyLiver: false },
   goal: "maintain",
   cuisines: [],
+};
+
+const defaultIntel: ProfileIntel = {
+  goalIntensity: undefined,
+  activityLevel: undefined,
+  proteinPreference: undefined,
+  carbSensitive: undefined,
+  eatingStyle: undefined,
+  portionAppetite: undefined,
+  wakeTime: undefined,
+  mealsPerDay: undefined,
+  dinnerTime: undefined,
 };
 
 function ConfirmModal({
@@ -83,7 +114,7 @@ function ConfirmModal({
                 <Pressable
                   style={[
                     styles.btn,
-                    confirmTone === "danger" ? styles.btnDanger : styles.btnPrimary,
+                    confirmTone === "danger" ? styles.btnDangerOutline : styles.btnPrimary,
                     busy ? styles.btnDisabled : null,
                   ]}
                   onPress={onConfirm}
@@ -110,16 +141,172 @@ function ToastInline({ kind, msg }: { kind: ToastKind; msg: string }) {
   );
 }
 
+function isTimeLikeHHMM(v?: string) {
+  if (!v) return true; // optional
+  const s = v.trim();
+  if (!/^\d{1,2}:\d{2}$/.test(s)) return false;
+  const [hh, mm] = s.split(":").map((x) => parseInt(x, 10));
+  if (Number.isNaN(hh) || Number.isNaN(mm)) return false;
+  if (hh < 0 || hh > 23) return false;
+  if (mm < 0 || mm > 59) return false;
+  return true;
+}
+
 export default function ProfileTab() {
   const [loading, setLoading] = useState(true);
   const [prefs, setPrefs] = useState<Preferences>(defaultPrefs);
+  const [intel, setIntel] = useState<ProfileIntel>(defaultIntel);
+
   const [cuisineInput, setCuisineInput] = useState("");
-
-  type CuisineCatalogItem = { id: string; label: string; aliases?: string[] };
-
   const [cuisineCatalog, setCuisineCatalog] = useState<CuisineCatalogItem[]>([]);
   const [catalogLoaded, setCatalogLoaded] = useState(false);
-  
+
+  // ✅ single authority for mode lives here now:
+  const { mode, status, requestEnableSync, requestDisableSync } = useMode();
+  const isSync = mode === "sync";
+  const modeReady = status === "ready";
+
+  const [toast, setToast] = useState<{ kind: ToastKind; msg: string } | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const [enableBusy, setEnableBusy] = useState(false);
+  const [disableBusy, setDisableBusy] = useState(false);
+
+  const [showEnableConfirm, setShowEnableConfirm] = useState(false);
+  const [showDisableConfirm, setShowDisableConfirm] = useState(false);
+
+  // Accordion: only one open at a time
+  type SectionKey = "goals" | "health" | "taste" | "habits";
+  const [open, setOpen] = useState<SectionKey>("goals");
+
+  const copy = useMemo(
+    () => ({
+      headerTitle: "Profile",
+      sub: "Premium, optional preferences. One section at a time.",
+
+      prefsTitle: "Profile preferences",
+      prefsSub: "Sync saves to server. Habits are on-device.",
+
+      saveBtn: "Save",
+
+      modeTitle: "Privacy & Sync",
+      modeSub: "Choose where your data lives.",
+      privacyTitle: "Privacy mode (default)",
+      privacyBody: "Everything stays on your device. Scores are generic.",
+      privacyBullets: ["All data stays on your device", "No health personalization used", "Generic scoring only"],
+
+      syncTitle: "Sync mode (opt-in)",
+      syncBody: "Sync enables cross-device history, personalization, and groups.",
+      syncBullets: ["Cross-device history", "Personalization and groups", "Preferences stored for Sync features"],
+
+      enableModalTitle: "Before you turn on Sync",
+      enableModalBody:
+        "Sync enables personalization, groups, and cross-device history. If you later turn Sync off, your server-stored data is deleted and you will be removed from all groups.",
+      disableModalTitle: "Disable Sync?",
+      disableModalBody: "This deletes server-stored profile data and removes you from all groups.",
+
+      whatStoreTitle: "What Sync stores",
+      whatStoreSub: "Only what’s needed to deliver Sync features:",
+      whatStoreBullets: ["Health toggles (optional)", "Your goal (lose / maintain / gain)", "Cuisine preferences"],
+      noAgeGender: "We do not store age or gender.",
+
+      syncOffTitle: "Sync is OFF",
+      syncOffSub: "Server preferences won’t save. Habits still save on-device.",
+      enableSyncBtn: "Enable Sync",
+
+      syncOnTitle: "Sync is ON",
+      syncOnSub: "Preferences are stored on server for Sync features.",
+      disableSyncBtn: "Disable Sync & Delete Server Data",
+      disableNote: "Disabling Sync deletes server-stored data and removes you from all groups.",
+
+      // Sections
+      goalsTitle: "Goals",
+      healthTitle: "Health",
+      tasteTitle: "Taste",
+      habitsTitle: "Habits",
+
+      // Labels
+      goalLabel: "Primary goal (Sync)",
+      goalIntensityLabel: "Goal intensity (on-device)",
+      carbLabel: "Carb sensitivity (on-device)",
+      cuisinesLabel: "Cuisines (Sync)",
+      eatingStyleLabel: "Eating style (on-device)",
+      mealsPerDayLabel: "Meals per day (on-device)",
+      dinnerTimeLabel: "Typical dinner time (on-device)",
+      wakeTimeLabel: "Typical wake time (on-device)",
+      activityLabel: "Activity level (on-device)",
+      proteinLabel: "Protein preference (on-device)",
+      portionLabel: "Portion appetite (on-device)",
+
+      addCuisinePlaceholder: "Type a cuisine…",
+      addCuisineBtn: "Add",
+      privacyNote: "Sync is required to save server preferences (goal/health/cuisines).",
+    }),
+    []
+  );
+
+  const cuisineSuggestions = useMemo(() => {
+    const q = cuisineInput.trim().toLowerCase();
+    if (!q) return [];
+    const selectedLower = new Set(prefs.cuisines.map((c) => c.toLowerCase()));
+    return cuisineCatalog
+      .filter((c) => (c.label || "").toLowerCase().includes(q))
+      .filter((c) => !selectedLower.has((c.label || "").toLowerCase()))
+      .slice(0, 8);
+  }, [cuisineInput, cuisineCatalog, prefs.cuisines]);
+
+  const accent = UI.colors.primary.teal; // Profile stays neutral; use teal for active borders/toggles
+
+  // ---------- Local intel storage ----------
+  async function loadLocalIntel() {
+    try {
+      const raw = await AsyncStorage.getItem(LOCAL_INTEL_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as ProfileIntel;
+      setIntel((p) => ({ ...p, ...parsed }));
+    } catch {
+      // ignore; on-device optional
+    }
+  }
+
+  async function saveLocalIntel(next: ProfileIntel) {
+    try {
+      await AsyncStorage.setItem(LOCAL_INTEL_KEY, JSON.stringify(next));
+    } catch {
+      // ignore; still allow app use
+    }
+  }
+
+  // ---------- Backend prefs load ----------
+  async function loadPrefsIfSync() {
+    setLoading(true);
+    setToast(null);
+
+    // Privacy: do not call backend
+    if (!isSync) {
+      setLoading(false);
+      return;
+    }
+
+    try {
+      let nextPrefs = defaultPrefs;
+      try {
+        const prefRes = await apiJson<{ preferences: Preferences | null }>("/v1/profile/preferences");
+        nextPrefs = prefRes?.preferences ?? defaultPrefs;
+      } catch (e: any) {
+        const msg = String(e?.message ?? "");
+        if (!msg.includes("Cannot GET /v1/profile/preferences")) throw e;
+        // route missing -> keep defaults silently
+      }
+      setPrefs(nextPrefs);
+    } catch (e: any) {
+      setToast({ kind: "error", msg: toUserMessage(e) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------- Cuisine catalog ----------
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -134,224 +321,42 @@ export default function ProfileTab() {
         setCatalogLoaded(true);
       }
     })();
-  
+
     return () => {
       cancelled = true;
     };
   }, []);
-  
-
-
-
-
-  
-  // ✅ single authority for mode lives here now:
-  const { mode, status, requestEnableSync, requestDisableSync } = useMode();
-  const isSync = mode === "sync";
-  const modeReady = status === "ready";
-
-  const [toast, setToast] = useState<{ kind: ToastKind; msg: string } | null>(null);
-
-  const [saving, setSaving] = useState(false);
-  const [enableBusy, setEnableBusy] = useState(false);
-  const [disableBusy, setDisableBusy] = useState(false);
-
-  const [showEnableConfirm, setShowEnableConfirm] = useState(false);
-  const [showDisableConfirm, setShowDisableConfirm] = useState(false);
-  const [showNotes, setShowNotes] = useState(false);
-  
-
-
-  const copy = useMemo(
-    () => ({
-      headerTitle: "Profile",
-      sub: "Preferences are optional and designed for zero-patience logging.",
-
-      prefsTitle: "Preferences",
-      prefsSub: "These help personalize Sync mode. Privacy mode uses generic scoring.",
-
-      healthTitle: "Health profile (optional)",
-      healthSub: "Only used in Sync mode. Not stored in Privacy mode.",
-
-      goalTitle: "Goal",
-      goalSub: "Used to tailor recommendations in Sync mode.",
-
-      cuisineTitle: "Cuisines",
-      cuisineSub: "Pick what you like. You can add more anytime.",
-
-      addCuisinePlaceholder: "American, Thai etc. Type a cuisine and press Add",
-      addCuisineBtn: "Add",
-      removeCuisineBtn: "Remove",
-
-      saveBtn: "Save preferences",
-
-      modeTitle: "Privacy & Sync",
-      modeSub: "Choose where your data lives.",
-      privacyTitle: "Privacy & Sync",
-      privacyBodyTitle: "Privacy mode (default)",
-      privacyBody:
-        "In Privacy mode, everything stays on your device. No health personalization is used, and scores are generic.",
-      privacyBullets: [
-        "All data stays on your device",
-        "No health personalization used",
-        "Generic scoring only",
-      ],
-      syncTitle: "Sync mode (opt-in)",
-      syncBodyTitle: "Sync mode (opt-in)",
-      syncBody:
-        "Sync enables cross-device history, personalization, and groups. Preferences are stored on the server for Sync features.",
-      syncBullets: [
-        "Cross-device history",
-        "Personalization and groups",
-        "Preferences stored on server for Sync features",
-      ],
-
-      whatStoreTitle: "What Sync stores",
-      whatStoreSub: "Only what’s needed to deliver Sync features:",
-      whatStoreBullets: ["Health toggles (optional)", "Your goal (lose / maintain / gain)", "Cuisine preferences"],
-      noAgeGender: "We do not store age or gender.",
-
-      syncOffTitle: "Sync is OFF",
-      syncOffSub: "Your preferences stay on this device.",
-      enableSyncBtn: "Enable Sync",
-
-      syncOnTitle: "Sync is ON",
-      syncOnSub: "Preferences are encrypted on the server for Sync features.",
-      disableSyncBtn: "Disable Sync & Delete Server Data",
-      disableNote: "Disabling Sync deletes server-stored profile data and removes you from all groups.",
-
-      budgetTitle: "Spending control",
-      budgetBody:
-        "Budgets are advisory. The app will notify you at 50%, 75%, 90%, and 100%. Nothing is blocked unless you choose to block it.",
-      budgetBullets: [
-        "Notifications only (no auto downgrade)",
-        "You can block OpenAI/Google features for the month",
-        "Generic scoring still works anytime",
-      ],
-
-      enableModalTitle: "Before you turn on Sync",
-      enableModalBody:
-        "Sync enables personalization, groups, and cross-device history. If you later turn Sync off, your server-stored data is deleted and you will be removed from all groups.",
-      disableModalTitle: "Disable Sync?",
-      disableModalBody: "This deletes server-stored profile data and removes you from all groups.",
-
-      notesTitle: "Details & notes",
-      notesBody:
-        "Privacy mode keeps everything on-device. Sync mode stores only what is required for cross-device sync and personalization. There is no silent downgrade or hidden cloud use.",
-      notesBtn: "Details",
-      notesClose: "Close",
-
-      privacyNote: "Privacy Mode ignores health preferences and uses generic scoring.",
-    }),
-    []
-  );
-
-  const cuisineSuggestions = useMemo(() => {
-    const q = cuisineInput.trim().toLowerCase();
-    if (!q) return [];
-  
-    const selectedLower = new Set(prefs.cuisines.map((c) => c.toLowerCase()));
-  
-    return cuisineCatalog
-      .filter((c) => (c.label || "").toLowerCase().includes(q))
-      .filter((c) => !selectedLower.has((c.label || "").toLowerCase()))
-      .slice(0, 8);
-  }, [cuisineInput, cuisineCatalog, prefs.cuisines]);
-  
-
-
-
-  async function loadAll() {
-    setLoading(true);
-    setToast(null);
-  
-    // ✅ ADD THIS BLOCK RIGHT HERE
-    if (!isSync) {
-      // Privacy mode: do not call backend. Treat as "local-only, no error".
-      setPrefs(defaultPrefs);      // optional: keep UI populated
-      setLoading(false);
-      return;
-    }
-  
-    try {
-      // IMPORTANT: mode is NOT loaded from backend anymore (local-first authority)
-  
-      let nextPrefs = defaultPrefs;
-      try {
-        const prefRes = await apiJson<{ preferences: Preferences | null }>("/v1/profile/preferences");
-        nextPrefs = prefRes?.preferences ?? defaultPrefs;
-      } catch (e: any) {
-        // sync mode but older backend may not have this route
-        const msg = String(e?.message ?? "");
-        if (!msg.includes("Cannot GET /v1/profile/preferences")) throw e;
-        // If route missing, just fall back to defaults silently
-      }
-  
-      setPrefs(nextPrefs);
-    } catch (e: any) {
-      setToast({ kind: "error", msg: toUserMessage(e) });
-    } finally {
-      setLoading(false);
-    }
-  }
-
 
   useEffect(() => {
-    let cancelled = false;
-  
-    async function loadCuisineCatalog() {
-      try {
-        const res = await apiJson<{ data: { cuisines: CuisineCatalogItem[] } }>("/v1/meta/cuisines");
-        if (cancelled) return;
-        setCuisineCatalog(res.data.cuisines || []);
-        setCatalogLoaded(true);
-      } catch {
-        // Don’t block profile UX if catalog fails. Keep free-text flow.
-        if (cancelled) return;
-        setCuisineCatalog([]);
-        setCatalogLoaded(true);
-      }
-    }
-  
-    // load once (or whenever screen mounts)
-    loadCuisineCatalog();
-  
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  
-
-
-
-  useEffect(() => {
-    loadAll();
+    loadLocalIntel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    loadPrefsIfSync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSync]);
+
+  // ---------- Sync enable/disable ----------
   async function enableSync() {
     setEnableBusy(true);
     setToast(null);
-  
+
     try {
       await requestEnableSync(async () => {
-        // IMPORTANT: await the API call
         await apiPost("/v1/profile/enable-sync", {});
       });
-  
-      // Close confirm modal only on success
+
       setShowEnableConfirm(false);
-  
       setToast({ kind: "success", msg: "Sync enabled." });
-      await loadAll();
+      await loadPrefsIfSync();
     } catch (e: any) {
       if (e?.name === "AbortError") {
-        Alert.alert("Can’t reach server. Check EXPO_PUBLIC_API_BASE_URL / Wi-Fi.", "Check API base URL / IP, then try again.");
+        Alert.alert("Can’t reach server", "Check API base URL / IP, then try again.");
         return;
       }
       Alert.alert("Enable Sync failed", e?.message ?? "Please try again.");
     } finally {
-      // ✅ This is what prevents “Working…” forever
       setEnableBusy(false);
     }
   }
@@ -366,7 +371,7 @@ export default function ProfileTab() {
 
       setShowDisableConfirm(false);
       setToast({ kind: "success", msg: "Sync disabled. Server data deleted." });
-      await loadAll();
+      await loadPrefsIfSync();
     } catch (e: any) {
       setToast({ kind: "error", msg: "Couldn’t disable Sync. Please try again." });
     } finally {
@@ -374,106 +379,201 @@ export default function ProfileTab() {
     }
   }
 
-  async function savePreferences() {
-    if (mode !== "sync") {
-      Alert.alert("Sync is off", "Enable Sync to save preferences.");
-      return;
-    }
-
-    setSaving(true);
-    setToast(null);
-    try {
-      const next: Preferences = {
-        health: { ...prefs.health },
-        goal: prefs.goal,
-        cuisines: [...prefs.cuisines],
-      };
-      //console.log("[profile/preferences] body=", JSON.stringify({ preferences: next }));
-      await apiJson("/v1/profile/preferences", {
-        method: "PUT",
-        body: JSON.stringify({ preferences: next }),
-      });
-
-      setPrefs(next);
-      setToast({ kind: "success", msg: "Saved. Your preferences are updated." });
-      await loadAll();
-    } catch (e: any) {
-      //console.error("[profile/preferences] save failed:", e?.stack ?? e);
-      //console.error("[profile/preferences] state:", { mode });
-      setToast({ kind: "error", msg: e?.message ?? "Couldn't save preferences. Please try again." });
-    }
-    
-
-    finally {
-      setSaving(false);
-    }
-  }
-
-
+  // ---------- Cuisine helpers (NO autosave) ----------
   function addCuisine(rawOverride?: string) {
+    if (!isSync) return;
     const raw = (rawOverride ?? cuisineInput).trim();
     if (!raw) return;
-  
+
     if (prefs.cuisines.some((c) => c.toLowerCase() === raw.toLowerCase())) {
       setCuisineInput("");
       return;
     }
-  
-    const next: Preferences = {
-      health: { ...prefs.health },
-      goal: prefs.goal,
-      cuisines: [...prefs.cuisines, raw],
-    };
-  
-    setPrefs(next);
+
+    setPrefs((p) => ({
+      ...p,
+      cuisines: [...p.cuisines, raw],
+    }));
     setCuisineInput("");
-    scheduleAutosave(next);
   }
-  
-  
+
   function removeCuisine(c: string) {
-    const next: Preferences = {
-      health: { ...prefs.health },
-      goal: prefs.goal,
-      cuisines: prefs.cuisines.filter((x) => x !== c),
-    };
-    setPrefs(next);
-    scheduleAutosave(next);
+    if (!isSync) return;
+    setPrefs((p) => ({
+      ...p,
+      cuisines: p.cuisines.filter((x) => x !== c),
+    }));
   }
-  
-  
-  const autosaveTimer = useRef<any>(null);
 
+  // ---------- Backend save (stable contract) with PUT->POST fallback ----------
+  async function persistPrefsStable(next: Preferences) {
+    // Only in Sync mode
+    if (!isSync) return;
 
-async function persistPreferences(next: Preferences) {
-  if (!isSync) return; // don’t write in Privacy mode
+    // try PUT first (current behavior)
+    try {
+      await apiJson("/v1/profile/preferences", {
+        method: "PUT",
+        body: JSON.stringify({ preferences: next }),
+      });
+      return;
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      const looksLikeMethodMismatch =
+        msg.includes("Cannot PUT /v1/profile/preferences") ||
+        msg.includes("Cannot POST /v1/profile/preferences") ||
+        msg.includes("Cannot") ||
+        msg.includes("405") ||
+        msg.includes("404");
 
-  setToast(null);
-  try {
+      if (!looksLikeMethodMismatch) throw e;
+    }
+
+    // fallback to POST (older environments)
     await apiJson("/v1/profile/preferences", {
-      method: "PUT", // if your backend is POST, change to "POST"
+      method: "POST",
       body: JSON.stringify({ preferences: next }),
     });
-    setToast({ kind: "success", msg: "Saved." });
-  } catch {
-    setToast({ kind: "error", msg: "Couldn’t save. Please try again." });
   }
-}
 
-function scheduleAutosave(next: Preferences) {
-  if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
-  autosaveTimer.current = setTimeout(() => {
-    persistPreferences(next);
-  }, 500);
-}
+  // ---------- Manual Save: backend prefs (if sync) + local intel (always) ----------
+  async function onSaveAll() {
+    setSaving(true);
+    setToast(null);
 
-const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
-  { label: "Lose", value: "lose" },
-  { label: "Maintain", value: "maintain" },
-  { label: "Gain", value: "gain" },
-];
+    const nextPrefs: Preferences = {
+      health: { ...prefs.health },
+      goal: prefs.goal,
+      cuisines: [...prefs.cuisines],
+    };
 
+    const nextIntel: ProfileIntel = {
+      ...intel,
+      // normalize time fields
+      wakeTime: intel.wakeTime?.trim() ? intel.wakeTime.trim() : undefined,
+      dinnerTime: intel.dinnerTime?.trim() ? intel.dinnerTime.trim() : undefined,
+    };
 
+    // validate time inputs (optional but must be valid if set)
+    if (!isTimeLikeHHMM(nextIntel.wakeTime)) {
+      setSaving(false);
+      setToast({ kind: "error", msg: "Wake time must be HH:MM (e.g., 07:30)." });
+      return;
+    }
+    if (!isTimeLikeHHMM(nextIntel.dinnerTime)) {
+      setSaving(false);
+      setToast({ kind: "error", msg: "Dinner time must be HH:MM (e.g., 19:30)." });
+      return;
+    }
+
+    try {
+      // Always save local intel (privacy-safe)
+      await saveLocalIntel(nextIntel);
+
+      // Save backend prefs only if Sync
+      if (isSync) {
+        await persistPrefsStable(nextPrefs);
+        setToast({ kind: "success", msg: "Saved. Sync preferences updated." });
+        await loadPrefsIfSync();
+      } else {
+        setToast({ kind: "success", msg: "Saved on-device. Enable Sync to sync preferences." });
+      }
+    } catch (e: any) {
+      setToast({ kind: "error", msg: e?.message ?? "Couldn’t save. Please try again." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // ---------- Pills ----------
+  function Pill({
+    label,
+    selected,
+    disabled,
+    onPress,
+    tone,
+  }: {
+    label: string;
+    selected?: boolean;
+    disabled?: boolean;
+    onPress?: () => void;
+    tone?: "neutral" | "accent";
+  }) {
+    const on = !!selected;
+    const dis = !!disabled;
+
+    const bg = on
+      ? tone === "accent"
+        ? "rgba(111, 174, 217, 0.14)" // teal tint
+        : UI.colors.successBg
+      : UI.colors.pill.neutralBg;
+
+    const border = on
+      ? tone === "accent"
+        ? "rgba(111, 174, 217, 0.28)"
+        : UI.colors.successBorder
+      : UI.colors.pill.neutralBorder;
+
+    return (
+      <Pressable
+        onPress={onPress}
+        disabled={dis}
+        style={[
+          styles.pill,
+          { backgroundColor: bg, borderColor: border, opacity: dis ? 0.55 : 1 },
+        ]}
+      >
+        <Text style={styles.pillText}>{label}</Text>
+      </Pressable>
+    );
+  }
+
+  function AccordionCard({
+    k,
+    title,
+    subtitle,
+    children,
+  }: {
+    k: SectionKey;
+    title: string;
+    subtitle?: string;
+    children: React.ReactNode;
+  }) {
+    const isOpen = open === k;
+    const dimOthers = open !== k;
+
+    return (
+      <View
+        style={[
+          styles.card,
+          isOpen ? styles.cardActive : null,
+          dimOthers ? styles.cardDim : null,
+        ]}
+      >
+        <Pressable
+          onPress={() => setOpen((prev) => (prev === k ? prev : k))}
+          style={styles.accordionHeader}
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={styles.h2}>{title}</Text>
+            {subtitle ? <Text style={styles.sub}>{subtitle}</Text> : null}
+          </View>
+
+          <View style={styles.chevWrap}>
+            <Text style={styles.chev}>{isOpen ? "▾" : "▸"}</Text>
+          </View>
+        </Pressable>
+
+        {isOpen ? <View style={styles.accordionBody}>{children}</View> : null}
+      </View>
+    );
+  }
+
+  const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
+    { label: "Lose", value: "lose" },
+    { label: "Maintain", value: "maintain" },
+    { label: "Gain", value: "gain" },
+  ];
 
   return (
     <View style={styles.screen}>
@@ -481,222 +581,346 @@ const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
         <View style={styles.section}>
           <Text style={styles.h1}>{copy.headerTitle}</Text>
           <Text style={styles.sub}>
-  {isSync ? "Sync is on for personalization + groups." : "Privacy mode is on (on-device)."}
-</Text>
+            {isSync ? "Sync is on for personalization + groups." : "Privacy mode is on (on-device)."}
+          </Text>
         </View>
 
         {toast ? <ToastInline kind={toast.kind} msg={toast.msg} /> : null}
 
-
-        {/* Preferences */}
+        {/* Profile Preferences (Accordion) */}
         <View style={styles.card}>
           <Text style={styles.h2}>{copy.prefsTitle}</Text>
           <Text style={styles.sub}>{copy.prefsSub}</Text>
-
           {!isSync ? <Text style={styles.note}>{copy.privacyNote}</Text> : null}
 
-          <View style={styles.block}>
-            <Text style={styles.strong}>{copy.healthTitle}</Text>
-
-            <View style={styles.switchRow}>
-              <Text style={styles.switchText}>Diabetes</Text>
-              <Switch
-                value={prefs.health.diabetes}
-                trackColor={{ false: UI.colors.outline, true: UI.colors.primary.teal }}
-                thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
-                ios_backgroundColor={UI.colors.outline}
-                onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, diabetes: v } }))}
-                disabled={!isSync}
-              />
-            </View>
-
-            <View style={styles.switchRow}>
-              <Text style={styles.switchText}>High BP</Text>
-              <Switch
-                value={prefs.health.highBP}
-                trackColor={{ false: UI.colors.outline, true: UI.colors.primary.teal }}
-                thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
-                ios_backgroundColor={UI.colors.outline}
-                onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, highBP: v } }))}
-                disabled={!isSync}
-              />
-            </View>
-
-            <View style={styles.switchRow}>
-              <Text style={styles.switchText}>Fatty liver</Text>
-              <Switch
-                value={prefs.health.fattyLiver}
-                trackColor={{ false: UI.colors.outline, true: UI.colors.primary.teal }}
-                thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
-                ios_backgroundColor={UI.colors.outline}
-                onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, fattyLiver: v } }))}
-                disabled={!isSync}
-              />
-            </View>
-          </View>
-
-
-          {/* Goal chips */}
-          <View style={styles.block}>
-            <Text style={styles.strong}>{copy.goalTitle}</Text>
-
-            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: UI.spacing.textGapSm }}>
-              {goalOptions.map((g) => {
-                const on = prefs.goal === g.value;
-                return (
-                  <Pressable
+          <View style={{ marginTop: UI.spacing.sectionGapSm, gap: UI.spacing.sectionGapSm }}>
+            <AccordionCard k="goals" title={copy.goalsTitle}>
+              <Text style={styles.label}>{copy.goalLabel}</Text>
+              <View style={styles.pillRow}>
+                {goalOptions.map((g) => (
+                  <Pill
                     key={g.value}
+                    label={g.label}
+                    selected={prefs.goal === g.value}
                     disabled={!isSync}
                     onPress={() => setPrefs((p) => ({ ...p, goal: g.value }))}
-                    style={[
-                      styles.pillBtn,
-                      on ? styles.pillBtnOn : styles.pillBtnOff,
-                      !isSync ? styles.btnDisabled : null,
-                    ]}
-                  >
-                    <Text style={styles.pillBtnText}>{g.label}</Text>
-                  </Pressable>
-                );
-              })}
-            </View>
+                    tone="accent"
+                  />
+                ))}
+              </View>
+
+              <View style={styles.divider} />
+
+              <Text style={styles.label}>{copy.goalIntensityLabel}</Text>
+              <View style={styles.pillRow}>
+                <Pill
+                  label="Light"
+                  selected={intel.goalIntensity === "light"}
+                  onPress={() => setIntel((p) => ({ ...p, goalIntensity: "light" }))}
+                />
+                <Pill
+                  label="Moderate"
+                  selected={intel.goalIntensity === "moderate"}
+                  onPress={() => setIntel((p) => ({ ...p, goalIntensity: "moderate" }))}
+                />
+                <Pill
+                  label="Aggressive"
+                  selected={intel.goalIntensity === "aggressive"}
+                  onPress={() => setIntel((p) => ({ ...p, goalIntensity: "aggressive" }))}
+                />
+              </View>
+            </AccordionCard>
+
+            <AccordionCard k="health" title={copy.healthTitle}>
+              <Text style={styles.label}>Health toggles (Sync)</Text>
+
+              <View style={styles.switchRow}>
+                <Text style={styles.switchText}>Diabetes</Text>
+                <Switch
+                  value={prefs.health.diabetes}
+                  trackColor={{ false: UI.colors.outline, true: accent }}
+                  thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
+                  ios_backgroundColor={UI.colors.outline}
+                  onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, diabetes: v } }))}
+                  disabled={!isSync}
+                />
+              </View>
+
+              <View style={styles.switchRow}>
+                <Text style={styles.switchText}>High BP</Text>
+                <Switch
+                  value={prefs.health.highBP}
+                  trackColor={{ false: UI.colors.outline, true: accent }}
+                  thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
+                  ios_backgroundColor={UI.colors.outline}
+                  onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, highBP: v } }))}
+                  disabled={!isSync}
+                />
+              </View>
+
+              <View style={styles.switchRow}>
+                <Text style={styles.switchText}>Fatty liver</Text>
+                <Switch
+                  value={prefs.health.fattyLiver}
+                  trackColor={{ false: UI.colors.outline, true: accent }}
+                  thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
+                  ios_backgroundColor={UI.colors.outline}
+                  onValueChange={(v) => setPrefs((p) => ({ ...p, health: { ...p.health, fattyLiver: v } }))}
+                  disabled={!isSync}
+                />
+              </View>
+
+              <View style={styles.divider} />
+
+              <Text style={styles.label}>{copy.carbLabel}</Text>
+              <View style={styles.switchRow}>
+                <Text style={styles.switchText}>Carb sensitive</Text>
+                <Switch
+                  value={!!intel.carbSensitive}
+                  trackColor={{ false: UI.colors.outline, true: accent }}
+                  thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
+                  ios_backgroundColor={UI.colors.outline}
+                  onValueChange={(v) => setIntel((p) => ({ ...p, carbSensitive: v }))}
+                />
+              </View>
+            </AccordionCard>
+
+            <AccordionCard k="taste" title={copy.tasteTitle}>
+              <Text style={styles.label}>{copy.cuisinesLabel}</Text>
+
+              <TextInput
+                value={cuisineInput}
+                onChangeText={setCuisineInput}
+                placeholder={copy.addCuisinePlaceholder}
+                placeholderTextColor={UI.colors.textMuted}
+                style={styles.input}
+                editable={isSync}
+                autoCorrect={false}
+                autoCapitalize="none"
+                returnKeyType="done"
+              />
+
+              <Pressable
+                style={[
+                  styles.btn,
+                  styles.btnSecondary,
+                  (!isSync || !cuisineInput.trim()) ? styles.btnDisabled : null,
+                  { marginTop: 10 },
+                ]}
+                onPress={() => addCuisine()}
+                disabled={!isSync || !cuisineInput.trim()}
+              >
+                <Text style={styles.btnSecondaryText}>{copy.addCuisineBtn}</Text>
+              </Pressable>
+
+              {prefs.cuisines.length > 0 && (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+                  {prefs.cuisines.map((c) => (
+                    <Pressable
+                      key={c}
+                      onPress={() => removeCuisine(c)}
+                      disabled={!isSync}
+                      style={[
+                        styles.chip,
+                        { opacity: isSync ? 1 : 0.55 },
+                      ]}
+                    >
+                      <Text style={styles.chipText}>{c}  ✕</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+
+              {cuisineInput.trim().length > 0 && (
+                <View style={{ marginTop: 10 }}>
+                  {!catalogLoaded ? (
+                    <Text style={[styles.muted, { fontSize: 12 }]}>Loading suggestions…</Text>
+                  ) : cuisineSuggestions.length > 0 ? (
+                    <View style={{ gap: 8 }}>
+                      <Text style={[styles.muted, { fontSize: 12 }]}>Suggestions</Text>
+
+                      {cuisineSuggestions.map((s) => (
+                        <Pressable
+                          key={s.id}
+                          onPress={() => addCuisine(s.label)}
+                          disabled={!isSync}
+                          style={[
+                            styles.suggestionRow,
+                            { opacity: isSync ? 1 : 0.55 },
+                          ]}
+                        >
+                          <Text style={styles.suggestionText}>{s.label}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  ) : (
+                    <Text style={[styles.muted, { fontSize: 12 }]}>
+                      No suggestions. Tap “Add” to save as a custom cuisine.
+                    </Text>
+                  )}
+                </View>
+              )}
+
+              <View style={styles.divider} />
+
+              <Text style={styles.label}>{copy.eatingStyleLabel}</Text>
+              <View style={styles.pillRow}>
+                <Pill
+                  label="Home"
+                  selected={intel.eatingStyle === "home"}
+                  onPress={() => setIntel((p) => ({ ...p, eatingStyle: "home" }))}
+                />
+                <Pill
+                  label="Balanced"
+                  selected={intel.eatingStyle === "balanced"}
+                  onPress={() => setIntel((p) => ({ ...p, eatingStyle: "balanced" }))}
+                />
+                <Pill
+                  label="Eat Out"
+                  selected={intel.eatingStyle === "eatout"}
+                  onPress={() => setIntel((p) => ({ ...p, eatingStyle: "eatout" }))}
+                />
+              </View>
+            </AccordionCard>
+
+            <AccordionCard k="habits" title={copy.habitsTitle}>
+              <Text style={styles.label}>{copy.mealsPerDayLabel}</Text>
+              <View style={styles.pillRow}>
+                {[2, 3, 4, 5].map((n) => (
+                  <Pill
+                    key={n}
+                    label={`${n}`}
+                    selected={intel.mealsPerDay === n}
+                    onPress={() => setIntel((p) => ({ ...p, mealsPerDay: n as 2 | 3 | 4 | 5 }))}
+                  />
+                ))}
+              </View>
+
+              <View style={styles.divider} />
+
+              <Text style={styles.label}>{copy.dinnerTimeLabel}</Text>
+              <TextInput
+                value={intel.dinnerTime ?? ""}
+                onChangeText={(t) => setIntel((p) => ({ ...p, dinnerTime: t }))}
+                placeholder="19:30"
+                placeholderTextColor={UI.colors.textMuted}
+                style={styles.input}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+
+              <Text style={[styles.label, { marginTop: UI.spacing.sectionGapSm }]}>{copy.wakeTimeLabel}</Text>
+              <TextInput
+                value={intel.wakeTime ?? ""}
+                onChangeText={(t) => setIntel((p) => ({ ...p, wakeTime: t }))}
+                placeholder="07:30"
+                placeholderTextColor={UI.colors.textMuted}
+                style={styles.input}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+
+              <View style={styles.divider} />
+
+              <Text style={styles.label}>{copy.activityLabel}</Text>
+              <View style={styles.pillRow}>
+                <Pill
+                  label="Sedentary"
+                  selected={intel.activityLevel === "sedentary"}
+                  onPress={() => setIntel((p) => ({ ...p, activityLevel: "sedentary" }))}
+                />
+                <Pill
+                  label="Moderate"
+                  selected={intel.activityLevel === "moderate"}
+                  onPress={() => setIntel((p) => ({ ...p, activityLevel: "moderate" }))}
+                />
+                <Pill
+                  label="Active"
+                  selected={intel.activityLevel === "active"}
+                  onPress={() => setIntel((p) => ({ ...p, activityLevel: "active" }))}
+                />
+              </View>
+
+              <Text style={[styles.label, { marginTop: UI.spacing.sectionGapSm }]}>{copy.proteinLabel}</Text>
+              <View style={styles.pillRow}>
+                <Pill
+                  label="Low"
+                  selected={intel.proteinPreference === "low"}
+                  onPress={() => setIntel((p) => ({ ...p, proteinPreference: "low" }))}
+                />
+                <Pill
+                  label="Medium"
+                  selected={intel.proteinPreference === "medium"}
+                  onPress={() => setIntel((p) => ({ ...p, proteinPreference: "medium" }))}
+                />
+                <Pill
+                  label="High"
+                  selected={intel.proteinPreference === "high"}
+                  onPress={() => setIntel((p) => ({ ...p, proteinPreference: "high" }))}
+                />
+              </View>
+
+              <Text style={[styles.label, { marginTop: UI.spacing.sectionGapSm }]}>{copy.portionLabel}</Text>
+              <View style={styles.pillRow}>
+                <Pill
+                  label="Small"
+                  selected={intel.portionAppetite === "small"}
+                  onPress={() => setIntel((p) => ({ ...p, portionAppetite: "small" }))}
+                />
+                <Pill
+                  label="Average"
+                  selected={intel.portionAppetite === "average"}
+                  onPress={() => setIntel((p) => ({ ...p, portionAppetite: "average" }))}
+                />
+                <Pill
+                  label="Large"
+                  selected={intel.portionAppetite === "large"}
+                  onPress={() => setIntel((p) => ({ ...p, portionAppetite: "large" }))}
+                />
+              </View>
+            </AccordionCard>
           </View>
 
-          <View style={styles.block}>
-            <Text style={styles.strong}>{copy.cuisineTitle}</Text>
-
-            <TextInput
-              value={cuisineInput}
-              onChangeText={setCuisineInput}
-              placeholder={copy.addCuisinePlaceholder}
-              placeholderTextColor={UI.colors.textMuted}
-              style={styles.input}
-              editable={isSync}
-              autoCorrect={false}
-              autoCapitalize="none"
-              returnKeyType="done"
-            />
-
-  {/* Add cuisine button (your addCuisine() was not wired before) */}
-  <Pressable
-    style={[
-      styles.btn,
-      styles.btnSecondary,
-      (!isSync || !cuisineInput.trim()) ? styles.btnDisabled : null,
-      { marginTop: 10 },
-    ]}
-    onPress={() => addCuisine()}
-    disabled={!isSync || !cuisineInput.trim()}
-  >
-    <Text style={styles.btnSecondaryText}>{copy.addCuisineBtn}</Text>
-  </Pressable>
-
-  {/* Selected cuisines chips */}
-  {prefs.cuisines.length > 0 && (
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
-      {prefs.cuisines.map((c) => (
-        <Pressable
-          key={c}
-          onPress={() => removeCuisine(c)}
-          disabled={!isSync}
-          style={{
-            paddingVertical: 6,
-            paddingHorizontal: 10,
-            borderRadius: 999,
-            borderWidth: 1,
-            borderColor: UI.colors.outline,
-            backgroundColor: UI.colors.surface,
-            opacity: isSync ? 1 : 0.5,
-          }}
-        >
-          <Text style={{ color: UI.colors.text, fontSize: 13 }}>{c}  ✕</Text>
-        </Pressable>
-      ))}
-    </View>
-  )}
-
-  {/* Suggestions (only when typing) */}
-  {cuisineInput.trim().length > 0 && (
-    <View style={{ marginTop: 10 }}>
-      {!catalogLoaded ? (
-        <Text style={[styles.muted, { fontSize: 12 }]}>Loading suggestions…</Text>
-      ) : cuisineSuggestions.length > 0 ? (
-        <View style={{ gap: 8 }}>
-          <Text style={[styles.muted, { fontSize: 12 }]}>Suggestions</Text>
-
-          {cuisineSuggestions.map((s) => (
-            <Pressable
-              key={s.id}
-              onPress={() => addCuisine(s.label)}
-              disabled={!isSync}
-              style={{
-                paddingVertical: 10,
-                paddingHorizontal: 12,
-                borderRadius: 12,
-                borderWidth: 1,
-                borderColor: UI.colors.outline,
-                backgroundColor: UI.colors.surface,
-                opacity: isSync ? 1 : 0.5,
-              }}
-            >
-              <Text style={{ color: UI.colors.text, fontSize: 14 }}>{s.label}</Text>
-            </Pressable>
-          ))}
-        </View>
-      ) : (
-        <Text style={[styles.muted, { fontSize: 12 }]}>
-          No suggestions. Tap “Add” to save as a custom cuisine.
-        </Text>
-      )}
-    </View>
-  )}
-          </View>
+          {/* Manual Save (both layers) */}
+          <Pressable
+            style={[
+              styles.btn,
+              styles.btnPrimary,
+              saving ? styles.btnDisabled : null,
+              { marginTop: UI.spacing.sectionGap },
+            ]}
+            onPress={onSaveAll}
+            disabled={saving}
+          >
+            {saving ? <ActivityIndicator /> : <Text style={styles.btnPrimaryText}>{copy.saveBtn}</Text>}
+          </Pressable>
         </View>
 
-
-        {/* ✅ Save button BETWEEN Preferences and Privacy/Sync cards */}
-        <Pressable
-          style={[
-            styles.btn,
-            styles.btnPrimary,
-            (!isSync || saving) ? styles.btnDisabled : null,
-          ]}
-          onPress={savePreferences}
-          disabled={!isSync || saving}
-        >
-          {saving ? <ActivityIndicator /> : <Text style={styles.btnPrimaryText}>{copy.saveBtn}</Text>}
-        </Pressable>
-
-
-
-
-
-{/* Privacy & Sync */}
-
+        {/* Privacy & Sync */}
         <View style={styles.card}>
           <View style={styles.rowBetween}>
             <View style={{ flex: 1 }}>
               <Text style={styles.h2}>{copy.modeTitle}</Text>
               <Text style={styles.sub}>{copy.modeSub}</Text>
             </View>
-            <View style={[styles.switchWrap, !modeReady && { opacity: 0.5 }]}>
 
-             <Text style={styles.switchLabel}>
-              {!modeReady ? "Starting…" : isSync ? "Sync" : "Privacy"}
-            </Text>
+            <View style={[styles.switchWrap, !modeReady && { opacity: 0.5 }]}>
+              <Text style={styles.switchLabel}>
+                {!modeReady ? "Starting…" : isSync ? "Sync" : "Privacy"}
+              </Text>
 
               <Switch
                 value={isSync}
                 disabled={!modeReady}
-                trackColor={{ false: UI.colors.outline, true: UI.colors.primary.teal }}
+                trackColor={{ false: UI.colors.outline, true: accent }}
                 thumbColor={Platform.OS === "android" ? UI.colors.surface : undefined}
                 ios_backgroundColor={UI.colors.outline}
                 onValueChange={(v) => {
-                  if (!modeReady) return; // ✅ hard guard
+                  if (!modeReady) return;
                   if (v) setShowEnableConfirm(true);
                   else setShowDisableConfirm(true);
                 }}
               />
-
             </View>
           </View>
 
@@ -744,10 +968,7 @@ const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
 
               <Text style={styles.note}>{copy.disableNote}</Text>
 
-              <Pressable
-                style={[styles.btn, styles.btnDangerOutline]}
-                onPress={() => setShowDisableConfirm(true)}
-              >
+              <Pressable style={[styles.btn, styles.btnDangerOutline]} onPress={() => setShowDisableConfirm(true)}>
                 <Text style={styles.btnDangerText}>{copy.disableSyncBtn}</Text>
               </Pressable>
             </View>
@@ -770,22 +991,6 @@ const goalOptions: Array<{ label: string; value: Preferences["goal"] }> = [
 
           <Text style={styles.note}>{copy.noAgeGender}</Text>
         </View>
-
-        {/* Spending control */}
-        <View style={styles.card}>
-          <Text style={styles.h2}>{copy.budgetTitle}</Text>
-          <Text style={styles.sub}>{copy.budgetBody}</Text>
-
-          <View style={{ marginTop: UI.spacing.gapSm }}>
-            {copy.budgetBullets.map((b) => (
-              <View key={b} style={styles.bulletRow}>
-                <Text style={styles.bullet}>•</Text>
-                <Text style={styles.bulletText}>{b}</Text>
-              </View>
-            ))}
-          </View>
-        </View>
-
 
         {loading ? (
           <View style={styles.loadingRow}>
@@ -866,6 +1071,12 @@ const styles = StyleSheet.create({
     marginTop: UI.spacing.textGapSm,
   },
 
+  label: {
+    color: UI.colors.textMuted,
+    fontSize: 12,
+    marginTop: UI.spacing.textGapSm,
+  },
+
   card: {
     backgroundColor: UI.colors.cardBg,
     borderRadius: UI.radius.card,
@@ -873,14 +1084,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: UI.colors.cardBorder,
     gap: UI.spacing.sectionGapSm,
-  
-    // premium depth
+
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 14,
     shadowOffset: { width: 0, height: 8 },
     elevation: 6,
   },
+
+  cardActive: {
+    borderColor: "rgba(111, 174, 217, 0.28)",
+  },
+
+  cardDim: {
+    // dim only within accordion list
+  },
+
   block: {
     gap: UI.spacing.textGapSm,
     marginTop: UI.spacing.sectionGapSm,
@@ -936,15 +1155,6 @@ const styles = StyleSheet.create({
     color: UI.colors.text,
   },
 
-  pickerWrap: {
-    marginTop: UI.spacing.textGapSm,
-    borderWidth: 1,
-    borderColor: UI.colors.outline,
-    borderRadius: UI.radius.md,
-    overflow: "hidden",
-    backgroundColor: UI.colors.surface,
-  },
-
   switchRow: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -986,18 +1196,13 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 
-  btnDanger: {
-    backgroundColor: UI.colors.errorBorder,
-    borderColor: UI.colors.errorBorder,
-  },
-
   btnDangerOutline: {
     backgroundColor: UI.colors.btnBg,
     borderColor: UI.colors.errorBorder,
   },
 
   btnDangerText: {
-    color: UI.colors.neutral[900],
+    color: UI.colors.text,
     fontWeight: "700",
   },
 
@@ -1071,39 +1276,83 @@ const styles = StyleSheet.create({
     marginTop: UI.spacing.sectionGapSm,
   },
 
+  // Accordion styling
+  accordionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: UI.spacing.gapSm,
+    paddingVertical: 6,
+  },
 
-  pillBtn: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
+  accordionBody: {
+    marginTop: UI.spacing.sectionGapSm,
   },
-  pillBtnOn: {
-    backgroundColor: UI.colors.successBg,
-    borderColor: UI.colors.successBorder,
-  },
-  pillBtnOff: {
+
+  chevWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
     backgroundColor: UI.colors.btnBg,
+    borderWidth: 1,
     borderColor: UI.colors.btnBorder,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  pillBtnText: {
+
+  chev: {
+    color: UI.colors.textDim,
+    fontSize: 16,
+    fontWeight: "700",
+    marginTop: -1,
+  },
+
+  pillRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginTop: UI.spacing.textGapSm,
+  },
+
+  pill: {
+    borderWidth: 1,
+    borderRadius: UI.radius.pill,
+    paddingVertical: UI.spacing.pillY,
+    paddingHorizontal: UI.spacing.pillX,
+  },
+
+  pillText: {
     color: UI.colors.text,
     fontWeight: "700",
     fontSize: 12,
   },
 
-  cuisineRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: UI.colors.outline,
+  chip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: UI.radius.pill,
+    borderWidth: 1,
+    borderColor: UI.colors.outline,
+    backgroundColor: UI.colors.surface,
   },
-  cuisineText: {
+
+  chipText: {
+    color: UI.colors.text,
+    fontSize: 13,
+    fontWeight: "600",
+  },
+
+  suggestionRow: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: UI.radius.md,
+    borderWidth: 1,
+    borderColor: UI.colors.outline,
+    backgroundColor: UI.colors.surface,
+  },
+
+  suggestionText: {
     color: UI.colors.text,
     fontSize: 14,
+    fontWeight: "600",
   },
-
-
 });

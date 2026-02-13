@@ -10,7 +10,7 @@ export function toUserMessage(err: unknown): string {
       (err instanceof Error && err.message === "NETWORK_BLOCKED_PRIVACY_MODE");
 
     if (isPrivacyBlock) {
-      return "Sync features are disabled in Privacy Mode. Switch to Sync in Profile to enable them.";
+      return "This feature requires Sync. Switch to Sync in Profile.";
     }
   }
 

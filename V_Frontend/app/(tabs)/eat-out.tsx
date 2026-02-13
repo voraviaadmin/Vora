@@ -127,6 +127,7 @@ const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[
       Alert.alert("Enable Sync", "Restaurant discovery uses backend services. Enable Sync in Profile.");
       return;
     }
+
   
     if (!selectedCuisines.length) {
       Alert.alert("Select cuisines", "Pick at least one cuisine to search nearby.");
@@ -135,6 +136,7 @@ const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[
   
     setSearching(true);
     try {
+ 
       const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.status !== "granted") {
         Alert.alert("Location needed", "Enable location to find nearby restaurants.");
@@ -148,10 +150,17 @@ const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[
       const resp = await syncEatOutRestaurantsNearby(
         { lat, lng, cuisines: selectedCuisines },
         { mode }
-      );
-  
+      ); 
       setRestaurants(resp.data.results);
       setFiltersOpen(false);
+
+      /*const resp = isSync
+      ? await syncEatOutRestaurantsNearby({ lat, lng, cuisines: selectedCuisines }, { mode })
+      : await privacyEatOutRestaurantsNearby({ lat, lng, cuisines: selectedCuisines }, { mode });
+  
+      setRestaurants(resp.data.results);
+      setFiltersOpen(false);*/
+
     } catch (e: any) {
       Alert.alert("Search failed", e?.message ?? "Try again.");
     } finally {

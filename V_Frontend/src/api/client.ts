@@ -39,6 +39,7 @@ async function waitForModeReady(timeoutMs = 2000) {
 }
 
 // ✅ Allowlist should be method + path
+/* Commented on 02122026 - Blocking Privacy Functionality
 function isAllowedInPrivacyMode(method: string, path: string): boolean {
   const p = normalizePath(path);
   const m = (method || "GET").toUpperCase();
@@ -48,7 +49,43 @@ function isAllowedInPrivacyMode(method: string, path: string): boolean {
   if (m === "POST" && p === "/v1/profile/disable-sync") return true;
 
   return false;
+}*/
+
+// ✅ Allowlist should be method + path
+function isAllowedInPrivacyMode(method: string, path: string): boolean {
+  const p = normalizePath(path);
+  const m = (method || "GET").toUpperCase();
+
+  // Always allow identity ping (boot)
+  if (m === "GET" && p === "/v1/me") return true;
+
+  // Allow read-only metadata (safe)
+  if (m === "GET" && p.startsWith("/v1/meta/")) return true;
+
+  // Allow read-only home summaries if you rely on backend for the Home tab
+  if (m === "GET" && p.startsWith("/v1/home/")) return true;
+
+  // Allow Sync enable/disable
+  if (m === "POST" && p === "/v1/profile/enable-sync") return true;
+  if (m === "POST" && p === "/v1/profile/disable-sync") return true;
+
+  // ✅ Privacy: generic typed-food scoring preview (no personalization)
+  if (m === "POST" && p === "/v1/profile/score-input-preview") return true;
+
+  // ✅ Privacy: OCR scan (backend can return blocked:true if cloud OCR is restricted)
+  if (m === "POST" && p === "/v1/scan/ocr") return true;
+
+  // ✅ Privacy: restaurant discovery browse (no menu scoring)
+  // Use the non-sync endpoint if you have it.
+  if (m === "GET" && p.startsWith("/v1/eatout/")) return true;
+  if (m === "GET" && p.startsWith("/v1/places/")) return true;
+
+  
+
+
+  return false;
 }
+
 
 type ApiErrorDetails = {
   status: number;

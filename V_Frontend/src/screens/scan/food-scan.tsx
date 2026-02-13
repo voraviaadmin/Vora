@@ -133,15 +133,15 @@ export default function FoodScanScreen() {
       setTextExpanded(false);
     }
   }, [start]);
-  
-  
+
+
   useEffect(() => {
     if (start === "text") {
       const t = setTimeout(() => inputRef.current?.focus(), 150);
       return () => clearTimeout(t);
     }
   }, [start]);
-  
+
 
 
 
@@ -155,14 +155,14 @@ export default function FoodScanScreen() {
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const cameraRef = useRef<CameraView | null>(null);
-const [scanning, setScanning] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
   const [itemsText, setItemsText] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [inlineError, setInlineError] = useState<string | null>(null);
 
-  
+
 
 
   const privacyCopy = useMemo(() => {
@@ -178,77 +178,186 @@ const [scanning, setScanning] = useState(false);
   }, [mode, ready]);
 
 
-  
+
 
   async function onScanPhoto() {
-      if (!ready) return;
-    
-      if (!permission?.granted) {
-        const res = await requestPermission();
-        if (!res.granted) {
-          setInlineError("Camera permission is required to scan.");
-          return;
-        }
-      }
-    
-      try {
-        setInlineError(null);
-        setScanning(true);
-    
-        const cam = cameraRef.current;
-        if (!cam) {
-          setInlineError("Camera not ready. Try again.");
-          return;
-        }
-    
-        // take picture (fast, no base64)
-        const photo: any = await (cam as any).takePictureAsync({
-          quality: 1,
-          skipProcessing: false,
-        });
-    
-        const uri = photo?.uri;
-        if (!uri) {
-          setInlineError("Could not capture photo. Try again.");
-          return;
-        }
-    
-        const ocrResp = await scanOcr({ uri, name: "scan.jpg", type: "image/jpeg" }, { mode });
-if (ocrResp?.meta?.blocked) {
-  setInlineError("Privacy mode: on-device OCR is coming soon. Type what you ate below.");
-  return;
-}
-        
-        
-        
-        
-        const text = ocrResp?.data?.text ?? "";
-    
-        if (!text.trim()) {
-          setInlineError("Couldn’t read text from that photo. Try again with better lighting.");
-          return;
-        }
+    if (!ready) return;
 
-         // In Sync (Vision-first): do NOT populate Type box.
-        // populate text field for user to edit
-        if (mode !== "sync") {
+    if (!permission?.granted) {
+      const res = await requestPermission();
+      if (!res.granted) {
+        setInlineError("Camera permission is required to scan.");
+        return;
+      }
+    }
+
+    try {
+      setInlineError(null);
+      setScanning(true);
+
+      const cam = cameraRef.current;
+      if (!cam) {
+        setInlineError("Camera not ready. Try again.");
+        return;
+      }
+
+      // take picture (fast, no base64)
+      const photo: any = await (cam as any).takePictureAsync({
+        quality: 1,
+        skipProcessing: false,
+      });
+
+      const uri = photo?.uri;
+      if (!uri) {
+        setInlineError("Could not capture photo. Try again.");
+        return;
+      }
+
+      const ocrResp = await scanOcr({ uri, name: "scan.jpg", type: "image/jpeg" }, { mode });
+      if (ocrResp?.meta?.blocked) {
+        setInlineError("Privacy mode: on-device OCR is coming soon. Type what you ate below.");
+        return;
+      }
+
+
+
+
+      const text = ocrResp?.data?.text ?? "";
+
+      if (!text.trim()) {
+        setInlineError("Couldn’t read text from that photo. Try again with better lighting.");
+        return;
+      }
+
+      // In Sync (Vision-first): do NOT populate Type box.
+      // populate text field for user to edit
+      if (mode !== "sync") {
         setItemsText(text.trim());
       }
-      
-    
-        // (recommended) auto-run preview
-        // IMPORTANT: your onPreview reads itemsText, so call it after state updates.
-        // simplest: call with direct string by temporarily setting local state:
-        // We'll just defer one tick:
-        setTimeout(() => {
-          onPreview(uri);
-        }, 0);
-      } catch (e: any) {
-        setInlineError(e?.message ?? "Scan failed. Try again.");
-      } finally {
-        setScanning(false);
-      }
+
+
+      // (recommended) auto-run preview
+      // IMPORTANT: your onPreview reads itemsText, so call it after state updates.
+      // simplest: call with direct string by temporarily setting local state:
+      // We'll just defer one tick:
+      setTimeout(() => {
+        onPreview(uri);
+      }, 0);
+    } catch (e: any) {
+      setInlineError(e?.message ?? "Scan failed. Try again.");
+    } finally {
+      setScanning(false);
+    }
   }
+
+
+  async function handleSyncPreview(photoUri?: string, text?: string) {
+    const hasPhoto = typeof photoUri === "string" && photoUri.startsWith("file:");
+  
+    // 1) Vision-first if photo exists
+    if (hasPhoto) {
+      console.log("Food-Scan handleSyncPreview - Vision-first", photoUri);
+      setItemsText("");
+  
+      const data = await scoreVisionV1(photoUri!, "sync");
+  
+      // 🔒 Make sure this is plain JSON (Hermes/JSI safety)
+      try {
+        JSON.stringify(data);
+      } catch {
+        throw new Error(
+          "SYNC_VISION_BAD_RESPONSE: non-serializable response (possible circular/native object)."
+        );
+      }
+  
+      if (!data?.scoringJson) {
+        throw new Error("AI response missing scoring details. Please try again.");
+      }
+  
+      setPreview(data);
+      setInlineError(null);
+      return;
+    }
+  
+    // 2) Text fallback
+    const cleanText = String(text ?? "").trim();
+    if (!cleanText) {
+      throw new Error("Take a photo (Vision-first), or type what you ate.");
+    }
+  
+    console.log("Food-Scan handleSyncPreview - Text fallback", cleanText);
+  
+    const res = await scoreV1({ context: "food_scan", input: { text: cleanText } }, { mode: "sync" });
+    const data: any = (res as any)?.data ?? res ?? null;
+  
+    if (!data?.scoringJson) {
+      throw new Error("AI response missing scoring details. Please try again.");
+    }
+  
+    // Optional: JSI safety on rich sync payload too
+    try {
+      JSON.stringify(data);
+    } catch {
+      throw new Error(
+        "SYNC_TEXT_BAD_RESPONSE: non-serializable response (possible circular/native object)."
+      );
+    }
+  
+    setPreview(data);
+    setInlineError(null);
+  }
+  
+  async function handlePrivacyPreview(text?: string) {
+    const cleanText = String(text ?? "").trim();
+  
+    // Privacy requires user-confirmed text (OCR can be messy)
+    if (!cleanText) {
+      setItemsText("In Privacy Mode, Camera Recognition can be inaccurate. Please type what you ate.");
+      throw new Error("Type what you ate.");
+    }
+  
+    // Optional guard: reject mostly-symbol OCR garbage (premium UX)
+    const lettersOnly = cleanText.replace(/[^a-zA-Z ]/g, "");
+    if (lettersOnly.trim().length < 3) {
+      throw new Error("OCR text unclear. Please edit before scoring.");
+    }
+  
+    console.log("Food-Scan handlePrivacyPreview - Text", cleanText);
+  
+    const res = await scoreV1({ context: "food_scan", input: { text: cleanText } }, { mode: "privacy" });
+    const data: any = (res as any)?.data ?? res ?? null;
+  
+    // Privacy may return scoring OR scoringJson (depending on backend version)
+    const scoringAny = data?.scoringJson ?? data?.scoring ?? null;
+    if (!scoringAny) {
+      throw new Error("Preview unavailable right now.");
+    }
+  
+    const normalized = data?.scoringJson
+      ? data
+      : {
+          ...data,
+          scoringJson: {
+            score: scoringAny.score,
+            label: "Good",
+            why: (scoringAny.reasons || []).slice(0, 1).join(" "),
+            reasons: scoringAny.reasons || [],
+            flags: [],
+            estimates: {
+              calories: null,
+              protein_g: null,
+              carbs_g: null,
+              fat_g: null,
+              sugar_g: null,
+              sodium_mg: null,
+            },
+          },
+        };
+  
+    setPreview(normalized);
+    setInlineError(null);
+  }
+  
 
   async function onPreview(photoUri?: string) {
     const text = String(itemsText ?? "").trim();
@@ -258,43 +367,11 @@ if (ocrResp?.meta?.blocked) {
     setPreviewLoading(true);
   
     try {
-      if (mode === "sync" && photoUri) {
-        // 1) VISION FIRST
-        const data = await scoreVisionV1(photoUri, mode);
-  
-        if (!data?.scoringJson) {
-          setInlineError("AI response missing scoring details. Please try again.");
-          return;
-        }
-  
-        setPreview(data);
-        console.log("Food-Scan onPreview itemName", data?.itemName);
-        console.log("Food-Scan onPreview score", data?.scoringJson?.score);
-        return;
+      if (mode === "sync") {
+        await handleSyncPreview(photoUri, text);
+      } else {
+        await handlePrivacyPreview(text);
       }
-  
-      // 2) TEXT SECONDARY (fallback)
-      if (!text) {
-        setInlineError(mode === "sync" ? "Take a photo (Vision-first), or type what you ate." : "Type what you ate.");
-        return;
-      }
-  
-      const res = await scoreV1({ context: "food_scan", input: { text } }, { mode });
-      const data = res?.data ?? null;
-  
-      if (mode === "sync" && !data?.scoringJson) {
-        setInlineError("AI response missing scoring details. Please try again.");
-        return;
-      }
-      if (mode !== "sync" && !data?.scoring) {
-        setInlineError("Preview unavailable right now.");
-        return;
-      }
-  
-      setPreview(data);
-
-
-
     } catch (e: any) {
       setInlineError(e?.message ?? "Couldn't preview right now.");
     } finally {
@@ -302,28 +379,29 @@ if (ocrResp?.meta?.blocked) {
     }
   }
   
-  
-  
+
+
+
 
   async function onSave() {
 
-const rawText = itemsText.trim();
-const text = cleanLogSummary(rawText, mode);
+    const rawText = itemsText.trim();
+    const text = cleanLogSummary(rawText, mode);
 
-if (text.length < 2) {
-  Alert.alert(
-    "Save log",
-    mode === "sync"
-      ? "Take a photo and preview score first (Vision-first), or type what you ate."
-      : "Type what you ate first."
-  );
-  return;
-}
+    if (text.length < 2) {
+      Alert.alert(
+        "Save log",
+        mode === "sync"
+          ? "Take a photo and preview score first (Vision-first), or type what you ate."
+          : "Type what you ate first."
+      );
+      return;
+    }
 
-  
+
     // Capture once so TS can narrow reliably
     const p = preview;
-  
+
     // Guard by mode (Sync requires scoringJson; Privacy requires scoring)
     if (mode === "sync") {
       if (!p?.scoringJson) {
@@ -336,14 +414,14 @@ if (text.length < 2) {
         return;
       }
     }
-  
+
     setSaving(true);
     setInlineError(null);
-  
+
     try {
       const derivedMealType = p?.scoring?.derived?.mealType ?? null;
       const mealType = mealTypeOverride ?? derivedMealType ?? null;
-  
+
       if (mode === "privacy") {
         // 🔐 LOCAL SAVE
         await addLocalLog({
@@ -353,12 +431,12 @@ if (text.length < 2) {
           source: "food_scan",
           scoring: p!.scoring, // safe due to guard above
         });
-  
+
         invalidateHomeSummary(); // local ring refresh
         Alert.alert("Saved", "Saved locally on this device.");
         return;
       }
-  
+
       // ☁️ SYNC MODE (existing behavior)
       const scoringJson = p!.scoringJson; // safe due to guard above
       const score = scoringJson?.score ?? null; // ✅ canonical
@@ -369,12 +447,21 @@ if (text.length < 2) {
       console.log("Food-Scan score", score);
 
 
-      const safeSummary =
+      /*const safeSummary =
         mode === "sync"
-        ? (itemName || "Food scan (photo)")
-        : text;
+          ? (itemName || "Food scan (photo)")
+          : text;*/
 
-  
+      const cleanText = String(text ?? "").trim();
+
+      const safeSummary =
+        (preview as any)?.itemName?.trim()
+          ? (preview as any)?.itemName.trim()
+          : cleanText
+            ? cleanText
+            : "Food entry";
+
+
       const out = await createMealLog(
         {
           summary: safeSummary,
@@ -385,7 +472,7 @@ if (text.length < 2) {
         },
         { mode }
       );
-  
+
       if ("logId" in out) {
         invalidateHomeSummary();
         Alert.alert("Saved", `Log saved (${out.logId}).`);
@@ -398,7 +485,7 @@ if (text.length < 2) {
       setSaving(false);
     }
   }
-  
+
 
   if (!ready) {
     return (
@@ -416,7 +503,7 @@ if (text.length < 2) {
   const previewWhy = mode === "sync" ? pj?.why : null;
   const previewReasons = mode === "sync" ? pj?.reasons : ps?.reasons;
   const previewFlags = mode === "sync" ? pj?.flags : ps?.flags;
-  
+
 
 
 
@@ -432,52 +519,56 @@ if (text.length < 2) {
 
 
         <View style={styles.card}>
-          
-  {/* Header row */}
-  <Pressable
 
-    onPress={() => setCameraExpanded((v) => !v)}
-    style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center",
-      paddingVertical: 6,}}
-  >
-    <Text style={styles.sectionTitle}>Camera</Text>
-    <Text style={styles.toggleText}>
-      {cameraExpanded ? "Hide" : "Use camera"}
-    </Text>
-  </Pressable>
+          {/* Header row */}
+          <Pressable
 
-  {/* Collapsible body */}
-  {cameraExpanded && (
-    <>
-        <View style={styles.cameraWrap}>
-            {permission?.granted ? (
-              <CameraView ref={cameraRef} style={styles.camera} />
-            ) : (
-              <View style={[styles.camera, styles.cameraPlaceholder]}>
-                <Text style={styles.cameraPlaceholderText}>Camera permission not granted</Text>
+            onPress={() => setCameraExpanded((v) => !v)}
+            style={{
+              flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+              paddingVertical: 6,
+            }}
+          >
+            <Text style={styles.sectionTitle}>Camera</Text>
+            <Text style={styles.toggleText}>
+              {cameraExpanded ? "Hide" : "Use camera"}
+            </Text>
+          </Pressable>
+
+          {/* Collapsible body */}
+          {cameraExpanded && (
+            <>
+              <View style={styles.cameraWrap}>
+                {permission?.granted ? (
+                  <CameraView ref={cameraRef} style={styles.camera} />
+                ) : (
+                  <View style={[styles.camera, styles.cameraPlaceholder]}>
+                    <Text style={styles.cameraPlaceholderText}>Camera permission not granted</Text>
+                  </View>
+                )}
               </View>
-            )}
-          </View>
 
-      <View style={styles.row}>
-        <PrimaryButton
-          title={scanning ? "Scanning..." : "Scan photo (Camera)"}
-          onPress={onScanPhoto}
-          disabled={scanning || busy || saving}
-          tone="secondary"
-        />
-      </View>
+              <View style={styles.row}>
+                <PrimaryButton
+                  title={scanning ? "Scanning..." : "Scan photo (Camera)"}
+                  onPress={onScanPhoto}
+                  disabled={scanning || busy || saving}
+                  tone="secondary"
+                />
+              </View>
 
-      <Text style={styles.tip}>{tipsCopy}</Text>
-    </>
-  )}
-</View>
+              <Text style={styles.tip}>{tipsCopy}</Text>
+            </>
+          )}
+        </View>
 
         <View style={styles.card}>
-                <Pressable
+          <Pressable
             onPress={() => setTextExpanded((v) => !v)}
-            style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center",
-              paddingVertical: 6,}}
+            style={{
+              flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+              paddingVertical: 6,
+            }}
           >
             <Text style={styles.sectionTitle}>Type</Text>
             <Text style={styles.toggleText}>
@@ -487,43 +578,43 @@ if (text.length < 2) {
 
           {textExpanded && (
             <>
-                  <Text style={styles.sectionTitle}>What did you eat?</Text>
-                  <TextInput
-                    ref={inputRef}
-                    returnKeyType="done"
-                    blurOnSubmit={true}
-                    style={styles.input}
-                    placeholder='Example: "gatorade" or "chicken salad"'
-                    placeholderTextColor={UI.colors.textMuted}
-                    multiline
-                    value={itemsText}
-                    onChangeText={(t) => {
-                      setItemsText(t);
-                      setInlineError(null);
-                      setPreview(null);
-                    }}
-                    textAlignVertical="top"
-                  />
+              <Text style={styles.sectionTitle}>What did you eat?</Text>
+              <TextInput
+                ref={inputRef}
+                returnKeyType="done"
+                blurOnSubmit={true}
+                style={styles.input}
+                placeholder='Example: "gatorade" or "chicken salad"'
+                placeholderTextColor={UI.colors.textMuted}
+                multiline
+                value={itemsText}
+                onChangeText={(t) => {
+                  setItemsText(t);
+                  setInlineError(null);
+                  setPreview(null);
+                }}
+                textAlignVertical="top"
+              />
 
-                  <View style={styles.rowSmall}>
-                    <PrimaryButton
-                      title="Clear"
-                      onPress={() => {
-                        setItemsText("");
-                        setPreview(null);
-                        setInlineError(null);
-                      }}
-                      tone="secondary"
-                      disabled={busy || saving || itemsText.trim().length === 0}
-                    />
-                  </View>
+              <View style={styles.rowSmall}>
+                <PrimaryButton
+                  title="Clear"
+                  onPress={() => {
+                    setItemsText("");
+                    setPreview(null);
+                    setInlineError(null);
+                  }}
+                  tone="secondary"
+                  disabled={busy || saving || itemsText.trim().length === 0}
+                />
+              </View>
 
-                  {inlineError ? <Text style={styles.inlineError}>{inlineError}</Text> : null}
-                  </>
+              {inlineError ? <Text style={styles.inlineError}>{inlineError}</Text> : null}
+            </>
           )}
         </View>
 
-        
+
         <View style={{ flexDirection: "row", marginTop: 12, marginBottom: 12 }}>
 
           <PrimaryButton
@@ -540,43 +631,43 @@ if (text.length < 2) {
             style={{ flex: 1 }}
           />
         </View>
-        
+
 
 
 
 
         {(mode === "sync" ? !!pj : !!ps) ? (
-  <View style={[styles.card, { marginTop: 12 }]}>
-    <Text style={styles.sectionTitle}>Preview</Text>
+          <View style={[styles.card, { marginTop: 12 }]}>
+            <Text style={styles.sectionTitle}>Preview</Text>
 
-    <Text style={styles.bigScore}>{previewScore ?? "—"}</Text>
-    {!!previewLabel ? <Text style={styles.previewLabel}>{previewLabel}</Text> : null}
+            <Text style={styles.bigScore}>{previewScore ?? "—"}</Text>
+            {!!previewLabel ? <Text style={styles.previewLabel}>{previewLabel}</Text> : null}
 
-    {mode === "sync" && !!previewWhy ? (
-      <Text style={styles.previewWhy}>{previewWhy}</Text>
-    ) : null}
+            {mode === "sync" && !!previewWhy ? (
+              <Text style={styles.previewWhy}>{previewWhy}</Text>
+            ) : null}
 
-    {Array.isArray(previewReasons) && previewReasons.length > 0 ? (
-      <View style={{ marginTop: UI.spacing.gapSm }}>
-        {normalizeReasons(previewReasons, { context: "food", max: 5 }).map((r: string, i: number) => (
-          <Text key={i} style={styles.reason}>• {r}</Text>
-        ))}
-      </View>
-    ) : (
-      <Text style={styles.tip}>No explanation yet.</Text>
-    )}
+            {Array.isArray(previewReasons) && previewReasons.length > 0 ? (
+              <View style={{ marginTop: UI.spacing.gapSm }}>
+                {normalizeReasons(previewReasons, { context: "food", max: 5 }).map((r: string, i: number) => (
+                  <Text key={i} style={styles.reason}>• {r}</Text>
+                ))}
+              </View>
+            ) : (
+              <Text style={styles.tip}>No explanation yet.</Text>
+            )}
 
-    {Array.isArray(previewFlags) && previewFlags.length > 0 ? (
-      <Text style={styles.tip}>Flags: {previewFlags.join(", ")}</Text>
-    ) : null}
+            {Array.isArray(previewFlags) && previewFlags.length > 0 ? (
+              <Text style={styles.tip}>Flags: {previewFlags.join(", ")}</Text>
+            ) : null}
 
-    {mode !== "sync" ? (
-      <Text style={styles.tip}>Turn on Sync for richer explanations + continuity (encrypted).</Text>
-    ) : (
-      <Text style={styles.tip}>Sync is on — explanations are saved per-log (encrypted).</Text>
-    )}
-  </View>
-) : null}
+            {mode !== "sync" ? (
+              <Text style={styles.tip}>Turn on Sync for richer explanations + continuity (encrypted).</Text>
+            ) : (
+              <Text style={styles.tip}>Sync is on — explanations are saved per-log (encrypted).</Text>
+            )}
+          </View>
+        ) : null}
 
 
 
@@ -635,7 +726,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 18,
   },
-  
+
   input: {
     minHeight: 110,
     borderRadius: UI.radius.inner,
@@ -661,7 +752,7 @@ const styles = StyleSheet.create({
 
   previewLabel: { color: UI.colors.textDim, fontWeight: "800", marginTop: 4 },
   previewWhy: { color: UI.colors.text, marginTop: UI.spacing.gapSm, lineHeight: 18 },
-  
+
 
 
 });

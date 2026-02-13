@@ -19,8 +19,8 @@ export function presentError(err: unknown): PresentedError {
 
     if (isPrivacyBlock) {
       return {
-        title: "Groups are available in Sync Mode",
-        body: "Privacy Mode keeps everything local. Switch to Sync in Profile to view or manage groups.",
+        title: "This action requires Sync",
+        body: "Privacy Mode blocks some network features. Switch to Sync in Profile to enable them.",
         tone: "neutral",
         cta: "go_to_profile",
       };

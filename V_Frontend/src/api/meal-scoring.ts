@@ -52,6 +52,10 @@ export type ScoreResponseV1 = {
 };
 
 
+
+
+
+
 export async function scoreV1(req: ScoreRequestV1, opts: ModeOpts) {
   if (opts.mode === "sync") {
     // Sync-only: OpenAI authoritative (backend enriches with profile/goals/cuisines)
@@ -108,10 +112,47 @@ export async function createMealLog(req: CreateLogRequest, opts: ModeOpts) {
   return apiPost<CreateLogResponse>("/v1/logs", req);
 }
 
+// src/api/meal-scoring.ts
+
+function normalizePreviewResponse(raw: any): ScoreMealInputResponse {
+  // Common shapes we might see:
+  // 1) { scoring: { score, reasons, confidence? } }
+  // 2) { data: { scoring: ... } }
+  // 3) { ok: true, data: { scoring: ... } }
+
+  const candidate =
+    raw?.scoring
+      ? raw
+      : raw?.data?.scoring
+        ? raw.data
+        : raw?.ok && raw?.data?.scoring
+          ? raw.data
+          : null;
+
+  if (candidate?.scoring && typeof candidate.scoring.score === "number") {
+    // Ensure reasons exists (avoid UI crashes)
+    if (!Array.isArray(candidate.scoring.reasons)) candidate.scoring.reasons = [];
+    return candidate as ScoreMealInputResponse;
+  }
+
+  // If API returned a string (HTML/text), surface it clearly
+  if (typeof raw === "string") {
+    throw new Error(`PREVIEW_BAD_RESPONSE: non-json body: ${raw.slice(0, 180)}`);
+  }
+
+  throw new Error(`PREVIEW_BAD_RESPONSE: missing scoring.score`);
+}
+
 export async function scoreMealInputPreview(input: MealInput, opts: ModeOpts) {
+  const raw = await apiPost<any>("/v1/profile/score-input-preview", { input });
+  return normalizePreviewResponse(raw);
+}
+
+
+/*export async function scoreMealInputPreview(input: MealInput, opts: ModeOpts) {
   // In privacy mode you may already have a stub endpoint. Keep existing behavior.
   return apiPost<ScoreMealInputResponse>("/v1/profile/score-input-preview", { input });
-}
+}*/
 
 export async function scanOcr(
   file: { uri: string; name: string; type: string },
@@ -232,6 +273,8 @@ export async function syncEatOutMenuScoreVision(
   form.append("file", file as unknown as Blob);
   return apiPostForm<EatOutScoreResponse>("/v1/sync/eatout/menu/score", form, {});
 }
+
+
 
 
 // ------------------------------
