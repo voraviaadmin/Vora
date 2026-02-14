@@ -130,40 +130,92 @@ function buildPrivacyHomeSummary(window: HomeWindow, allLogs: LocalLog[]): HomeS
         ? "Based on 1 local log."
         : `Based on ${count} local logs.`;
 
-  // Keep shape compatible with your existing Home UI (header/hero/actions/etc)
+  const items = current.slice(0, 5).map((l) => ({
+    logId: l.id,
+    capturedAt: l.capturedAt ?? null,
+    summary: l.summary ?? null,
+    mealType: l.mealType ?? null,
+    score: typeof l.scoring?.score === "number" ? l.scoring.score : null,
+  }));
+
+
+  const confidence =
+  count >= 8 ? 0.78 :
+  count >= 4 ? 0.58 :
+  count >= 2 ? 0.42 :
+  count >= 1 ? 0.32 :
+  0.2;
+
+const confidenceLabel =
+  confidence >= 0.75 ? "high" :
+  confidence >= 0.45 ? "medium" :
+  "low";
+
   return {
+    meta: {
+      window,
+      generatedAt: new Date().toISOString(),
+      syncMode: "privacy",
+      mode: "individual",
+      subjectMemberId: undefined,
+    },
+
     header: {
+      title: "Home",
+      subtitle: count === 0 ? "No logs yet" : `${count} logs in window`,
       modeLabel: "Privacy • Local",
       streakDays,
     },
+
     heroScore: {
       value: score,
       label: labelForWindow(window),
+      resetsText: "Tap ring to switch window",
       statusWord: score >= 75 ? "Great" : score >= 50 ? "Good" : score > 0 ? "Start" : "Start",
       description,
-      resetsText: "Tap ring to switch window",
+      confidence: null,
     },
+
     actions: {
-      primaryCta: { title: "Scan Food", subtitle: null },
-      secondaryCta: { title: "Find Restaurant" },
+      primaryCta: { id: "scan", title: "Scan Food", subtitle: null },
+      secondaryCta: { id: "eatout", title: "Find Restaurant", subtitle: null },
     },
+
     todaysFocus: {
       title: "Today’s Focus",
       chips: [],
+      totals: null,
     },
+
+    
     suggestion: {
-      title: "Best next meal",
+      title: "Next step",
       suggestionText:
-        count === 0 ? "Log 1–2 meals to unlock a recommendation." : "Keep logging to improve accuracy.",
-      contextNote: "",
+        count === 0
+          ? "Log 1–2 meals to unlock a recommendation."
+          : "Keep logging to improve accuracy.",
+      contextNote: null,
+    
+      confidence,
+      confidenceLabel,
+      route: { searchKey: null },
+      dishIdeas: [],
+      restaurantQuery: null,
     },
-  } as any;
+    
+
+    recentLogs: {
+      items,
+    },
+  };
 }
+
 
 /* ---------------------------------- Hook --------------------------------- */
 
 export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5): UseHomeSummaryState {
-  const { mode } = useMode();
+  const { mode: rawMode } = useMode();
+  const mode = rawMode === "privacy" ? "privacy" : "sync";
 
   const cacheKey = useMemo(() => keyFor(window, limit, mode), [window, limit, mode]);
 
@@ -191,12 +243,12 @@ export function useHomeSummary(window: HomeWindow = "daily", limit: number = 5):
   const fetchOnce = useCallback(
     async (loadMode: "load" | "refresh") => {
 
-// ✅ prevent double-fetch when initial load + focus fire close together
-if (inFlightRef.current === cacheKey) {
-  console.log("[HOME] double-fetch prevented", cacheKey);
-  return;
-}
-inFlightRef.current = cacheKey;
+      // ✅ prevent double-fetch when initial load + focus fire close together
+      if (inFlightRef.current === cacheKey) {
+        console.log("[HOME] double-fetch prevented", cacheKey);
+        return;
+      }
+      inFlightRef.current = cacheKey;
 
 
       try {
@@ -216,7 +268,7 @@ inFlightRef.current = cacheKey;
         }
 
         // ☁️ Sync: server-backed
-        const resp = await (getHomeSummary as any)(window, limit);
+        const resp = await getHomeSummary(window, limit);
 
         if (!aliveRef.current) return;
         CACHE.set(cacheKey, { at: Date.now(), data: resp });
@@ -252,7 +304,7 @@ inFlightRef.current = cacheKey;
       if (!CACHE.has(cacheKey) && !data) {
         fetchOnce("load");
       }
-      return () => {};
+      return () => { };
     }, [cacheKey, fetchOnce])
   );
 

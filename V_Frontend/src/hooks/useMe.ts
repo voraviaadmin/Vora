@@ -1,13 +1,8 @@
 // src/hooks/useMe.ts
 import { useEffect, useState } from "react";
 import { apiJson } from "../api/client";
-
-export type MeResponse = {
-  userId: string;
-  memberId: string | null;
-  activeMemberId: string | null;
-  allowedMemberIds: string[];
-};
+import type { MeResponse } from "../api/me"; // ✅ single source of truth
+import { getMe } from "../api/me";
 
 type UseMeResult = {
   data: MeResponse | null;
@@ -29,7 +24,7 @@ export function useMe(): UseMeResult {
       setError(null);
 
       try {
-        const resp = await apiJson<MeResponse>("/v1/me");
+        const resp = await getMe();
         if (!mounted) return;
         setData(resp);
       } catch (e: any) {
