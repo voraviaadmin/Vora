@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState} from "react";
+import React from "react";
 import {
   ScrollView,
   StyleSheet,
@@ -8,7 +9,7 @@ import {
   Modal,
   ActivityIndicator,
 } from "react-native";
-import { router } from "expo-router";
+import { useFocusEffect, router } from "expo-router";
 
 import { UI } from "../../src/theme/ui";
 import { useMe } from "../../src/hooks/useMe";
@@ -152,25 +153,39 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
 } {
   const anyHome = home as any;
 
-  const bestNextMeal = anyHome?.bestNextMeal ?? null;
-  if (bestNextMeal?.options?.length) {
-    const tier = tierFromConfidence(bestNextMeal?.intent?.confidence?.score);
-    const opts: DishOptionView[] = (bestNextMeal.options as any[]).map((o) => ({
-      kind: o.kind === "home" ? "home" : "eatout",
-      title: String(o.title ?? "Option"),
-      why: Array.isArray(o.why) ? o.why.slice(0, 2) : [],
-      searchKey: o?.route?.type === "restaurant_search" ? o?.route?.searchKey : null,
-    }));
+  // ✅ NEW preferred path: backend provides executionPlan under suggestion
+  const s = anyHome?.suggestion ?? null;
+  const plan = s?.executionPlan ?? null;
 
-    const insights = Array.isArray(bestNextMeal?.insightsCollapsed)
-      ? bestNextMeal.insightsCollapsed.slice(0, 2).map(String)
+  if (plan?.primaryOption) {
+    const conf = plan?.meta?.confidence;
+    const tier = tierFromConfidence(typeof conf === "number" ? conf : (s as any)?.confidence);
+
+    const primary = plan.primaryOption;
+    const secondary = plan.secondaryOption ?? null;
+
+    const toView = (opt: any): DishOptionView => ({
+      kind: opt?.executionHints?.channel === "home" ? "home" : "eatout",
+      title: String(opt?.title ?? "Option"),
+      // plan uses one-liner "why" (string). UI expects string[].
+      why: opt?.why ? [String(opt.why)].slice(0, 2) : [],
+      searchKey: opt?.executionHints?.searchKey ?? null,
+    });
+
+    const options: DishOptionView[] = [toView(primary)];
+    if (secondary) options.push(toView(secondary));
+
+    // Insights: show 1–2 microSteps when expanded (you already have collapse UI)
+    const insights = Array.isArray(plan?.microSteps)
+      ? plan.microSteps.slice(0, 2).map(String)
+      : s?.contextNote
+      ? [String(s.contextNote)]
       : undefined;
 
-    return { tier, options: opts, insights };
+    return { tier, options: options.slice(0, tier === "medium" ? 3 : 2), insights };
   }
 
-  // Legacy fallback: suggestion-based
-  const s = home?.suggestion ?? null;
+  // ---- Legacy fallback: suggestion-based (your current behavior)
   const tier = tierFromConfidence((s as any)?.confidence);
 
   const key =
@@ -183,16 +198,15 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
     { kind: "home", title: "Simple home plate", why: [] },
   ];
 
-  // Medium: add a third lightweight option (still no extra blocks)
   if (tier === "medium") {
     options.push({ kind: "eatout", title: "Second nearby option", why: [], searchKey: key });
   }
 
-  // Insights fallback: contextNote if present
   const insights = (s as any)?.contextNote ? [String((s as any).contextNote)] : undefined;
 
   return { tier, options: options.slice(0, tier === "medium" ? 3 : 2), insights };
 }
+
 
 export default function HomeScreen() {
   const { mode } = useModeGate();
@@ -202,7 +216,14 @@ export default function HomeScreen() {
   const backendOk = !!me && !meIsError;
 
   const [window, setWindow] = useState<HomeWindow>("daily");
-  const { data: home } = useHomeSummary(window, 5);
+
+  const { data: home, refetch } = useHomeSummary(window, 5);
+
+  useFocusEffect(
+    React.useCallback(() => {
+      if (!isPrivacy) refetch?.();
+    }, [refetch, isPrivacy, window])
+  );
 
   // animate ring only once per app session
   const [animateRing, setAnimateRing] = useState(() => !homeRingAnimatedOnce);
@@ -271,16 +292,24 @@ export default function HomeScreen() {
   const [cookOpen, setCookOpen] = useState(false);
   const [cookLoading] = useState(false);
 
+  const plan = (home as any)?.suggestion?.executionPlan ?? null;
+
   const onPressOption = (opt: DishOptionView) => {
     if (opt.kind === "eatout") {
-      // If low confidence and user chose a cuisine chip, use that as searchKey preference
       const key = selectedCuisine ? selectedCuisine : (opt.searchKey ?? undefined);
       goEatOut(key ?? undefined);
       return;
     }
+  
     // home
-    setCookOpen(true);
+    // Optional: only open if plan has howToCook action (future)
+    if (plan?.actions?.howToCook) {
+      setCookOpen(true);
+    } else {
+      setCookOpen(true); // keep current behavior for now
+    }
   };
+  
 
   // Today Focus pills: max 3
   const focusChips = useMemo(() => {

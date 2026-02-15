@@ -195,6 +195,57 @@ async function scoreVisionOne(
  * Prompt builders
  * ----------------------- */
 
+export type PlateScoreJsonV2 = {
+  items: Array<{
+    itemName: string;                 // concise, 2–6 words
+    description: string | null;       // optional, short
+    portion: { grams: number | null; serving: string };
+    confidence: number;              // 0..1
+
+    scoring: {
+      score: number;                 // 0..100
+      label: "Good" | "Ok" | "Not Preferred";
+      why: string;
+      reasons: string[];
+      flags: string[];
+      nutritionNotes: string | null;
+      estimates: {
+        calories: number | null;
+        protein_g: number | null;
+        carbs_g: number | null;
+        fat_g: number | null;
+        fiber_g: number | null;      // NEW (optional but recommended)
+        sugar_g: number | null;
+        sodium_mg: number | null;
+      };
+      features: {
+        cuisineMatch: "high" | "medium" | "low";
+        goalAlignment: "high" | "medium" | "low";
+        healthRisk: "low" | "medium" | "high";
+        satiety: "low" | "medium" | "high";
+      };
+    };
+  }>;
+
+  totalMealNutrition: {
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
+    fiber_g: number | null;
+    sugar_g: number | null;
+    sodium_mg: number | null;
+  };
+
+  overall: {
+    score: number; // 0..100 (weighted by calories or grams)
+    label: "Good" | "Ok" | "Not Preferred";
+    why: string;   // 1-2 sentences
+    flags: string[];
+  };
+};
+
+
 function buildTextPrompt(args: {
   source: ScoreSource;
   itemName: string;
@@ -303,6 +354,98 @@ Rules:
 - Do NOT include explanations in itemName.
 - scoringJson must strictly follow schema.
 - Return JSON only.
+`.trim();
+}
+
+
+function buildPlateVisionPrompt(args: {
+  detectedText: string | null;
+  cuisine: string | null;
+  mealType: string | null;
+  userPreferences: unknown;
+}): string {
+  return `
+You are a certified clinical nutritionist and global food recognition expert.
+
+Analyze the entire meal image and return FULL PLATE intelligence.
+
+User preferences JSON:
+${JSON.stringify(args.userPreferences ?? null)}
+
+Context:
+- cuisine: ${args.cuisine ?? "unknown"}
+- mealType: ${args.mealType ?? "unknown"}
+- detectedText (OCR if provided): ${args.detectedText ?? "none"}
+
+Requirements (must follow):
+1) Identify ALL visible food items (include small bowls/sides/condiments).
+2) Estimate portion per item in grams AND serving words.
+3) Provide nutrition estimates per item:
+   calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg.
+4) Score EACH item using the same scoring rubric you use today (0-100, Good/Ok/Not Preferred).
+5) Provide total meal nutrition as the sum of item estimates (sum only fields that are not null).
+6) Provide an overall meal score (weighted by item calories when available; otherwise grams; otherwise equal weight).
+7) Handle uncertainty:
+   - include confidence (0..1) per item
+   - if uncertain, set nutrition fields to null and lower confidence
+   - do NOT hallucinate brand names
+
+Return STRICT JSON only with EXACT keys and structure:
+
+{
+  "items": [
+    {
+      "itemName": "",
+      "description": null,
+      "portion": { "grams": null, "serving": "" },
+      "confidence": 0.0,
+      "scoring": {
+        "score": 0,
+        "label": "Good",
+        "why": "",
+        "reasons": [],
+        "flags": [],
+        "nutritionNotes": null,
+        "estimates": {
+          "calories": null,
+          "protein_g": null,
+          "carbs_g": null,
+          "fat_g": null,
+          "fiber_g": null,
+          "sugar_g": null,
+          "sodium_mg": null
+        },
+        "features": {
+          "cuisineMatch": "low",
+          "goalAlignment": "low",
+          "healthRisk": "low",
+          "satiety": "low"
+        }
+      }
+    }
+  ],
+  "totalMealNutrition": {
+    "calories": null,
+    "protein_g": null,
+    "carbs_g": null,
+    "fat_g": null,
+    "fiber_g": null,
+    "sugar_g": null,
+    "sodium_mg": null
+  },
+  "overall": {
+    "score": 0,
+    "label": "Good",
+    "why": "",
+    "flags": []
+  }
+}
+
+Rules:
+- Output JSON ONLY. No markdown. No extra keys.
+- Every item must have portion.serving filled even if grams is null.
+- Keep reasons 2–3 short bullets per item.
+- flags max 8 per item; overall.flags max 8.
 `.trim();
 }
 

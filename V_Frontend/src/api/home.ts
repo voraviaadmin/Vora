@@ -43,37 +43,34 @@ export type HomeSummaryResponse = {
 
   suggestion:
   | {
-    title: string;
-    suggestionText: string;
-    contextNote?: string | null;
-
-    // ✅ add these (used by adaptive UI)
-    confidence?: number | null; // 0..1
-    confidenceLabel?: "low" | "medium" | "high" | string | null;
-
-    // ✅ used for eat-out routing/search
-    route?: {
-      searchKey?: string | null;
-    } | null;
-
-    // ✅ used for idea cards
-    dishIdeas?: Array<{
       title: string;
-      query?: string | null;
-      tags?: string[] | null;
-    }> | null;
+      suggestionText: string;
+      contextNote?: string | null;
 
-    // keep existing
-    restaurantQuery?: { cuisine?: string | null; tags?: string[] | null } | null;
-  }
+      confidence?: number | null;
+      confidenceLabel?: "low" | "medium" | "high" | string | null;
+
+      route?: { searchKey?: string | null } | null;
+
+      dishIdeas?: Array<{
+        title: string;
+        query?: string | null;
+        tags?: string[] | null;
+      }> | null;
+
+      // ✅ ADD THESE (backend now includes them)
+      intent?: any | null;
+      executionPlan?: any | null;
+    }
   | null;
 
+
   // ✅ NEW: return intent + dish options (used by adaptive UI)
-  bestNextMeal?: {
+  /*bestNextMeal?: {
     intent: BestNextMealIntent;
     options: DishOption[];
     insightsCollapsed?: string[]; // 0–2
-  } | null;
+  } | null;*/
 
   recentLogs: {
     items: Array<{

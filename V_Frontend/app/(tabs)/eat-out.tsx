@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, StyleSheet, Text, View, ScrollView, TextInput, Pressable } from "react-native";
-import { useFocusEffect, useRouter } from "expo-router";
+import { useFocusEffect, useRouter, useLocalSearchParams} from "expo-router";
 
 import { UI } from "../../src/theme/ui";
 import { Card } from "../../components/ui/card";
@@ -12,6 +12,8 @@ import { getLocalMenuDraft } from "../../src/storage/local-logs";
 import * as Location from "expo-location";
 import { syncEatOutRestaurantsNearby } from "../../src/api/meal-scoring";
 import { apiJson } from "../../src/api/client";
+
+
 
 
 
@@ -60,6 +62,13 @@ export default function EatOutTabScreen() {
 const [cuisineCatalog, setCuisineCatalog] = useState<CuisineCatalogItem[]>([]);
 const [catalogLoaded, setCatalogLoaded] = useState(false);
 const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[]>([]);
+
+const params = useLocalSearchParams<{ searchKey?: string }>();
+const inboundSearchKey = typeof params?.searchKey === "string" ? params.searchKey : null;
+
+// guard so it only runs once per navigation
+const [autoRan, setAutoRan] = useState(false);
+
 
 
 
@@ -122,21 +131,24 @@ const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[
   
 
 
-  async function runSearch() {
+  async function runSearch(opts?: { forceSearchKey?: string | null; ignoreCuisineFilters?: boolean }) {
     if (!isSync) {
       Alert.alert("Enable Sync", "Restaurant discovery uses backend services. Enable Sync in Profile.");
       return;
     }
-
   
-    if (!selectedCuisines.length) {
+    const ignoreCuisineFilters = !!opts?.ignoreCuisineFilters;
+  
+    // If coming from Home with a searchKey, we do NOT require cuisines
+    const effectiveCuisines = ignoreCuisineFilters ? [] : selectedCuisines;
+  
+    if (!opts?.forceSearchKey && !effectiveCuisines.length) {
       Alert.alert("Select cuisines", "Pick at least one cuisine to search nearby.");
       return;
     }
   
     setSearching(true);
     try {
- 
       const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.status !== "granted") {
         Alert.alert("Location needed", "Enable location to find nearby restaurants.");
@@ -147,26 +159,55 @@ const [cuisineSuggestions, setCuisineSuggestions] = useState<CuisineCatalogItem[
       const lat = loc.coords.latitude;
       const lng = loc.coords.longitude;
   
+      // Backend contract upgrade: add optional searchKey + allow cuisines empty
       const resp = await syncEatOutRestaurantsNearby(
-        { lat, lng, cuisines: selectedCuisines },
+        {
+          lat,
+          lng,
+          cuisines: effectiveCuisines,
+          // ✅ new optional param (backend should ignore if not supported yet)
+          searchKey: opts?.forceSearchKey ?? null,
+        } as any,
         { mode }
-      ); 
-      setRestaurants(resp.data.results);
-      setFiltersOpen(false);
-
-      /*const resp = isSync
-      ? await syncEatOutRestaurantsNearby({ lat, lng, cuisines: selectedCuisines }, { mode })
-      : await privacyEatOutRestaurantsNearby({ lat, lng, cuisines: selectedCuisines }, { mode });
+      );
   
-      setRestaurants(resp.data.results);
-      setFiltersOpen(false);*/
-
+      const results = resp?.data?.results ?? [];
+      setRestaurants(results);
+      setFiltersOpen(false);
+  
+      // ✅ fallback: if cuisine filters yield 0, re-run ignoring cuisines (searchKey-only)
+      if (!results.length && !ignoreCuisineFilters && (opts?.forceSearchKey ?? null)) {
+        const retry = await syncEatOutRestaurantsNearby(
+          {
+            lat,
+            lng,
+            cuisines: [],
+            searchKey: opts?.forceSearchKey ?? null,
+          } as any,
+          { mode }
+        );
+        setRestaurants(retry?.data?.results ?? []);
+        setFiltersOpen(false);
+      }
     } catch (e: any) {
       Alert.alert("Search failed", e?.message ?? "Try again.");
     } finally {
       setSearching(false);
     }
   }
+  
+  useEffect(() => {
+    if (!isSync) return;
+    if (!inboundSearchKey) return;
+    if (autoRan) return;
+  
+    setAutoRan(true);
+  
+    // If user already has cuisines selected, try with them first.
+    // If none selected, run searchKey-only.
+    runSearch({ forceSearchKey: inboundSearchKey, ignoreCuisineFilters: selectedCuisines.length === 0 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSync, inboundSearchKey, autoRan]);
   
 
   useEffect(() => {

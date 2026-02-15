@@ -4,12 +4,96 @@ import {
   buildProfileSummary,
   buildDailyVector2,
   getBestNextMealV2,
-  type Behavior14Day,
 } from "../../intelligence/engine";
 import { computeTodayTotals, compute14DayBehavior } from "../logs/service";
-// If your crypto export name differs, change this import accordingly.
 import { decryptProfile } from "../profile/crypto";
+import { buildMacroGapExecutionPlan } from "../../intelligence/macro-gap";
+import type { BestNextMealIntent as MacroIntent, ExecutionPlan as MacroPlan } from "../../intelligence/macro-gap";
 
+
+/**
+ * Option C (Hybrid deterministic + AI refinement) — small TTL
+ * - Deterministic options always produced (cheap + stable).
+ * - AI refinement is Sync-only and never blocks Home.
+ * - Intent object is forward-compatible with QR/Humanoid.
+ */
+
+/* -------------------------------- Types --------------------------------- */
+
+type HomeWindow = "daily" | "3d" | "7d" | "14d";
+
+export type DishOption = {
+  id: string;
+  title: string;
+
+  // Phase 1: keep it to searchKey (restaurant search primary)
+  mode: "eatout" | "home";
+  searchKey?: string | null;
+
+  tags?: string[]; // small pills, max 2
+  why?: string | null;
+
+  // lightweight confidence (0..1) for UI pill if you want
+  confidence?: number | null;
+};
+
+export type ExecutionPlan = {
+  version: 1;
+  primaryOptionId: string;
+  steps: Array<
+    | { type: "eatout_search"; searchKey: string }
+    | { type: "cook"; dishName: string; notes?: string | null }
+  >;
+
+  // reserved for QR/humanoid sharing without ecosystem lock-in
+  disclosure?: {
+    shareMode: "none" | "qr_reserved";
+    shareToken?: string | null; // future
+    expiresAt?: string | null;
+  };
+};
+
+export type BestNextMealIntent = {
+  version: 1;
+  id: string;
+  ttlSec: number;
+  generatedAt: string;
+
+  context: {
+    syncMode: "privacy" | "sync";
+    window: HomeWindow;
+    subjectMemberId: string;
+  };
+
+  today: {
+    focus?: {
+      deficitText?: string | null; // from vector
+      riskText?: string | null; // from vector
+    } | null;
+
+    totals?: {
+      calories: number;
+      protein_g: number;
+      sugar_g: number;
+      sodium_mg: number;
+      fiber_g: number;
+    } | null;
+  };
+
+  behavior14d?: {
+    commonCuisine?: string | null;
+    // keep open for future signals without breaking clients
+    [k: string]: any;
+  } | null;
+
+  options: DishOption[];
+
+  // On-demand (future): server can return ONLY this object
+  // if user taps “Best Next Meal”.
+  executionPlan?: ExecutionPlan | null;
+};
+
+/* ------------------------------ Helpers ---------------------------------- */
 
 function readUserPrefsSyncOnly(db: any, userId: string): any | null {
   const row = db
@@ -17,19 +101,13 @@ function readUserPrefsSyncOnly(db: any, userId: string): any | null {
     .get(userId) as { encryptedJson?: string } | undefined;
 
   if (!row?.encryptedJson) return null;
-
   try {
-    // decryptProfile should return the plain prefs object
     const prefs = decryptProfile(row.encryptedJson);
     return prefs && typeof prefs === "object" ? prefs : null;
   } catch {
     return null;
   }
 }
-
-
-
-type HomeWindow = "daily" | "3d" | "7d" | "14d";
 
 function windowLabel(window: HomeWindow) {
   if (window === "daily") return "Daily Score";
@@ -71,12 +149,8 @@ function isSyncEnabled(db: any, userId: string) {
 
 function statusForScore(score: number, hasData: boolean) {
   if (!hasData) {
-    return {
-      statusWord: "Start",
-      description: "Log a meal to build your daily score.",
-    };
+    return { statusWord: "Start", description: "Log a meal to build your daily score." };
   }
-
   if (score >= 80) return { statusWord: "Excellent", description: "Keep it steady. Small choices add up." };
   if (score >= 65) return { statusWord: "Good", description: "A couple smart choices will help." };
   if (score >= 50) return { statusWord: "Okay", description: "You’re close. One balanced meal can lift today." };
@@ -87,7 +161,11 @@ function safeJsonParse(v: any): any | null {
   if (!v) return null;
   if (typeof v === "object") return v;
   if (typeof v === "string") {
-    try { return JSON.parse(v); } catch { return null; }
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -100,239 +178,13 @@ function getEstimatesFromRow(r: any): any | null {
 
 function hasAnyNumericEstimate(e: any): boolean {
   if (!e) return false;
-  const keys = ["calories","protein_g","carbs_g","fat_g","sugar_g","sodium_mg","fiber_g"];
-  return keys.some(k => Number.isFinite(Number(e[k])));
+  const keys = ["calories", "protein_g", "carbs_g", "fat_g", "sugar_g", "sodium_mg", "fiber_g"];
+  return keys.some((k) => Number.isFinite(Number(e[k])));
 }
-
-type DishIdea = {
-  title: string;
-  query: string;
-  cuisineHint?: string | null;
-  tags?: string[];
-};
 
 function clampStr(s: any, max: number) {
   const v = typeof s === "string" ? s.trim() : "";
   return v.length > max ? v.slice(0, max) : v;
-}
-
-function sanitizeIdeas(raw: any): { ideas: DishIdea[]; searchKey: string } | null {
-  const ideasRaw = raw?.ideas;
-  const searchKeyRaw = raw?.searchKey;
-
-  if (!Array.isArray(ideasRaw)) return null;
-
-  const ideas: DishIdea[] = ideasRaw
-    .slice(0, 3)
-    .map((x: any) => ({
-      title: clampStr(x?.title, 60),
-      query: clampStr(x?.query, 80) || clampStr(x?.title, 80),
-      cuisineHint: x?.cuisineHint ? clampStr(x.cuisineHint, 30) : null,
-      tags: Array.isArray(x?.tags) ? x.tags.slice(0, 2).map((t: any) => clampStr(t, 18)).filter(Boolean) : [],
-    }))
-    .filter((i) => i.title && i.query);
-
-  const searchKey = clampStr(searchKeyRaw, 80);
-
-  if (ideas.length !== 3) return null;
-
-  return { ideas, searchKey: searchKey || ideas[0].query };
-}
-
-async function generateDishIdeasAI(input: {
-  apiKey: string;
-  model: string;
-  timeWindow: string;
-  bullets: string[];
-  cuisineHint?: string | null;
-  recentSummaries: string[];
-  modeLabel: "sync";
-  aiPersonality?: "straight" | "encouraging" | "coach"; // ✅ NEW
-}): Promise<{ ideas: DishIdea[]; searchKey: string } | null> {
-  // non-medical, concise JSON output
-
-  const tone =
-  input.aiPersonality === "straight"
-    ? "Write in a direct, no-fluff tone. Keep it short."
-    : input.aiPersonality === "encouraging"
-    ? "Write in a warm, encouraging tone. Be positive and motivating."
-    : input.aiPersonality === "coach"
-    ? "Write in a coach-like tone with 2–3 action steps."
-    : "Write in a warm, encouraging tone. Keep it concise.";
-
-
-
-  const prompt = {
-    timeWindow: input.timeWindow,
-    guidanceBullets: input.bullets,
-    cuisineHint: input.cuisineHint ?? null,
-    recentLogs: input.recentSummaries.slice(0, 10),
-    tone, // ✅ NEW (the model will follow this)
-    constraints: {
-      count: 3,
-      style: "premium, simple, non-medical, no numbers, restaurant-search friendly",
-      output: "JSON only",
-    },
-  };
-
-  const controller = new AbortController();
-const t = setTimeout(() => controller.abort(), 1400); // 1.4s hard stop (tune)
-
-
-try {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${input.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: input.model,
-      temperature: 0.6,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You generate 3 personalized dish ideas for a nutrition app. " +
-            "Be non-medical, concise, and restaurant-search friendly. " +
-            "Output MUST be valid JSON with keys: { searchKey: string, ideas: [{title, query, cuisineHint?, tags?}] }. " +
-            "No extra keys, no commentary.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify(prompt),
-        },
-      ],
-    }),
-  }
-);
-
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  const text = data?.choices?.[0]?.message?.content;
-  const parsed = safeJsonParse(text);
-  return sanitizeIdeas(parsed);
-} catch (e) {
-  return null; // NEVER block Home
-} finally {
-  clearTimeout(t);
-}
-}
-
-type TodayTotals = {
-  calories: number;
-  protein_g: number;
-  sugar_g: number;
-  sodium_mg: number;
-  fiber_g: number;
-};
-
-function computeTodayTotalsFromRows(rows: any[]): TodayTotals {
-  // NOTE: implement using r.summary if it contains nutrients; otherwise return zeros safely
-  const totals: TodayTotals = { calories: 0, protein_g: 0, sugar_g: 0, sodium_mg: 0, fiber_g: 0 };
-
-  for (const r of rows) {
-    const s = safeParseSummary(r.summary);
-    if (!s) continue;
-
-    // if summary stores these keys
-    totals.calories += num(s.calories);
-    totals.protein_g += num(s.protein_g ?? s.protein);
-    totals.sugar_g += num(s.sugar_g ?? s.sugar);
-    totals.sodium_mg += num(s.sodium_mg ?? s.sodium);
-    totals.fiber_g += num(s.fiber_g ?? s.fiber);
-  }
-
-  return totals;
-}
-
-function computeBehavior14dFromRows(rows: any[], targets?: { sodium_mg_max?: number; protein_g?: number }): Behavior14Day {
-  // Minimal safe defaults; you can refine once nutrients schema is confirmed
-  const days = new Map<string, { sodium: number; protein: number; calories: number; sugar: number; fiber: number; cuisines: Record<string, number> }>();
-
-  for (const r of rows) {
-    const dayKey = (r.capturedAt ?? "").slice(0, 10); // YYYY-MM-DD
-    if (!dayKey) continue;
-
-    const s = safeParseSummary(r.summary);
-    if (!s) continue;
-
-    const entry = days.get(dayKey) ?? { sodium: 0, protein: 0, calories: 0, sugar: 0, fiber: 0, cuisines: {} };
-
-    entry.calories += num(s.calories);
-    entry.protein += num(s.protein_g ?? s.protein);
-    entry.sodium += num(s.sodium_mg ?? s.sodium);
-    entry.sugar += num(s.sugar_g ?? s.sugar);
-    entry.fiber += num(s.fiber_g ?? s.fiber);
-
-    const cuisine = typeof s.cuisine === "string" ? s.cuisine.trim() : "";
-    if (cuisine) entry.cuisines[cuisine] = (entry.cuisines[cuisine] ?? 0) + 1;
-
-    days.set(dayKey, entry);
-  }
-
-  const dayEntries = Array.from(days.values());
-  const n = Math.max(1, dayEntries.length);
-
-  const avgCalories = Math.round(dayEntries.reduce((a, d) => a + d.calories, 0) / n);
-  const avgProtein_g = Math.round(dayEntries.reduce((a, d) => a + d.protein, 0) / n);
-  const avgSodium_mg = Math.round(dayEntries.reduce((a, d) => a + d.sodium, 0) / n);
-  const avgSugar_g = Math.round(dayEntries.reduce((a, d) => a + d.sugar, 0) / n);
-  const avgFiber_g = Math.round(dayEntries.reduce((a, d) => a + d.fiber, 0) / n);
-
-  const sodiumMax = targets?.sodium_mg_max ?? 2300;
-  const proteinTarget = targets?.protein_g ?? 110;
-
-  const highSodiumDays = dayEntries.filter((d) => d.sodium >= sodiumMax).length;
-  const lowProteinDays = dayEntries.filter((d) => d.protein <= Math.max(0, proteinTarget * 0.8)).length;
-
-  // Common cuisine (simple most-frequent)
-  const cuisineCounts: Record<string, number> = {};
-  for (const d of dayEntries) {
-    for (const [c, cnt] of Object.entries(d.cuisines)) cuisineCounts[c] = (cuisineCounts[c] ?? 0) + cnt;
-  }
-  const commonCuisine =
-    Object.entries(cuisineCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-
-  return {
-    avgCalories,
-    avgProtein_g,
-    avgSodium_mg,
-    avgSugar_g,
-    avgFiber_g,
-    highSodiumDaysPct: n ? highSodiumDays / n : 0,
-    lowProteinDaysPct: n ? lowProteinDays / n : 0,
-    commonCuisine,
-  };
-}
-
-function safeParseSummary(summary: any): any | null {
-  if (!summary) return null;
-  if (typeof summary === "object") return summary;
-  if (typeof summary === "string") {
-    try {
-      return JSON.parse(summary);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function num(v: any): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); })
-     .catch((e) => { clearTimeout(t); reject(e); });
-  });
 }
 
 function clamp01(n: any) {
@@ -341,6 +193,18 @@ function clamp01(n: any) {
   return Math.max(0, Math.min(1, v));
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
 
 // IMPORTANT: request-scoped single-call guard (backend safety)
 function getHomeAiGuard(req: Request) {
@@ -348,40 +212,271 @@ function getHomeAiGuard(req: Request) {
   if (typeof anyReq.__homeAiUsed !== "boolean") anyReq.__homeAiUsed = false;
   return {
     used: () => Boolean(anyReq.__homeAiUsed),
-    mark: () => { anyReq.__homeAiUsed = true; }
+    mark: () => {
+      anyReq.__homeAiUsed = true;
+    },
   };
 }
 
-export async function getHomeSummary(
-  req: Request,
-  opts: { window: HomeWindow; limit: number }
+function makeIntentId(ctx: { userId: string; memberId: string }, now: Date) {
+  const day = now.toISOString().slice(0, 10); // YYYY-MM-DD
+  return `bni_${ctx.userId}_${ctx.memberId}_${day}`;
+}
+
+// --- Tiny TTL cache (server process local, small TTL, safe for v1)
+type CacheEntry<T> = { expiresAt: number; value: T };
+const homePlanCache = new Map<string, CacheEntry<any>>();
+
+function cacheGet<T>(key: string): T | null {
+  const hit = homePlanCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    homePlanCache.delete(key);
+    return null;
+  }
+  return hit.value as T;
+}
+
+function cacheSet<T>(key: string, ttlMs: number, value: T) {
+  homePlanCache.set(key, { expiresAt: Date.now() + ttlMs, value });
+}
+
+
+type MacroPlanBundle = {
+  intent: MacroIntent;
+  plan: MacroPlan;
+  vector: any; // you can tighten later to DailyVector2 if exported cleanly
+  options: any[]; // we map to your local DishOption anyway
+};
+
+
+function patchPlanSearchKeyFromRefined(
+  plan: any | null,
+  refinedOptions: DishOption[]
 ) {
+  if (!plan || !refinedOptions?.length) return plan;
+
+  const primaryKey = refinedOptions[0]?.searchKey || refinedOptions[0]?.title;
+  if (!primaryKey) return plan;
+
+  // Only patch if plan uses goEatOut
+  if (plan?.actions?.goEatOut && typeof plan.actions.goEatOut.searchKey === "string") {
+    return {
+      ...plan,
+      actions: {
+        ...plan.actions,
+        goEatOut: { searchKey: primaryKey },
+      },
+    };
+  }
+  return plan;
+}
+
+
+function prefsFingerprint(prefs: any): string {
+  try {
+    const cuisines = Array.isArray(prefs?.cuisines) ? prefs.cuisines.map(String).sort() : [];
+    const goal = prefs?.goal ? String(prefs.goal) : "";
+    const health = prefs?.health ? JSON.stringify(prefs.health) : "";
+    const aiTone = prefs?.aiPersonality ? String(prefs.aiPersonality) : "";
+    return `${cuisines.join(",")}|${goal}|${aiTone}|${health}`.slice(0, 200);
+  } catch {
+    return "";
+  }
+}
+
+
+
+
+/* ------------------- Option C: Deterministic + AI refine ------------------ */
+
+type DishIdea = { title: string; query: string; tags?: string[] };
+
+function sanitizeIdeas(raw: any): { ideas: DishIdea[]; searchKey: string } | null {
+  const ideasRaw = raw?.ideas;
+  const searchKeyRaw = raw?.searchKey;
+  if (!Array.isArray(ideasRaw)) return null;
+
+  const ideas: DishIdea[] = ideasRaw
+    .slice(0, 3)
+    .map((x: any) => ({
+      title: clampStr(x?.title, 60),
+      query: clampStr(x?.query, 80) || clampStr(x?.title, 80),
+      tags: Array.isArray(x?.tags)
+        ? x.tags.slice(0, 2).map((t: any) => clampStr(t, 18)).filter(Boolean)
+        : [],
+    }))
+    .filter((i) => i.title && i.query);
+
+  const searchKey = clampStr(searchKeyRaw, 80);
+  if (ideas.length < 2) return null;
+
+  return { ideas, searchKey: searchKey || ideas[0].query };
+}
+
+async function generateDishIdeasAI(input: {
+  apiKey: string;
+  model: string;
+  bullets: string[];
+  cuisineHint?: string | null;
+  recentSummaries: string[];
+  aiPersonality?: "straight" | "encouraging" | "coach";
+}): Promise<{ ideas: DishIdea[]; searchKey: string } | null> {
+  const tone =
+    input.aiPersonality === "straight"
+      ? "Write in a direct, no-fluff tone. Keep it short."
+      : input.aiPersonality === "encouraging"
+        ? "Write in a warm, encouraging tone. Be positive and motivating."
+        : input.aiPersonality === "coach"
+          ? "Write in a coach-like tone with 2–3 action steps."
+          : "Write in a warm, encouraging tone. Keep it concise.";
+
+  const prompt = {
+    timeWindow: "next meal",
+    guidanceBullets: input.bullets.slice(0, 6),
+    cuisineHint: input.cuisineHint ?? null,
+    recentLogs: input.recentSummaries.slice(0, 10),
+    tone,
+    constraints: {
+      count: 3,
+      style: "premium, simple, non-medical, restaurant-search friendly",
+      output: "JSON only",
+    },
+  };
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 1400);
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${input.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: input.model,
+        temperature: 0.6,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You generate 3 personalized dish ideas for a nutrition app. " +
+              "Be non-medical, concise, and restaurant-search friendly. " +
+              "Output MUST be valid JSON with keys: { searchKey: string, ideas: [{title, query, tags?}] }. " +
+              "No extra keys, no commentary.",
+          },
+          { role: "user", content: JSON.stringify(prompt) },
+        ],
+      }),
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content;
+    const parsed = safeJsonParse(text);
+    return sanitizeIdeas(parsed);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function buildDeterministicOptions(input: {
+  bestTitle?: string | null;
+  cuisineHint?: string | null;
+  deficitText?: string | null;
+}): DishOption[] {
+  const a = clampStr(input.bestTitle || "High-protein bowl", 60);
+  const cuisine = clampStr(input.cuisineHint || "", 24);
+
+  const opt1: DishOption = {
+    id: "opt_1",
+    title: a || "High-protein bowl",
+    mode: "eatout",
+    searchKey: a || "high protein bowl",
+    tags: ["Best"],
+    why: input.deficitText ? `Supports: ${clampStr(input.deficitText, 40)}` : "Simple, balanced choice.",
+    confidence: 0.6,
+  };
+
+  const opt2Title = cuisine ? `${cuisine} lean plate` : "Greek chicken salad";
+  const opt2Query = cuisine ? `${cuisine} grilled chicken` : "greek chicken salad";
+  const opt2: DishOption = {
+    id: "opt_2",
+    title: clampStr(opt2Title, 60),
+    mode: "eatout",
+    searchKey: clampStr(opt2Query, 80),
+    tags: ["Option"],
+    why: "Lean protein + greens.",
+    confidence: 0.5,
+  };
+
+  const opt3: DishOption = {
+    id: "opt_3",
+    title: "Salmon + veggies",
+    mode: "eatout",
+    searchKey: "salmon vegetables",
+    tags: ["Option"],
+    why: "Protein + micronutrients.",
+    confidence: 0.45,
+  };
+
+  return [opt1, opt2, opt3].slice(0, 3);
+}
+
+function mergeAiIdeasIntoOptions(options: DishOption[], ai: DishIdea[] | null): DishOption[] {
+  if (!ai?.length) return options;
+  const next = [...options];
+  for (let i = 0; i < Math.min(next.length, ai.length); i++) {
+    next[i] = {
+      ...next[i],
+      title: ai[i]?.title || next[i].title,
+      searchKey: ai[i]?.query || next[i].searchKey,
+      tags: Array.isArray(ai[i]?.tags) && ai[i]!.tags!.length
+        ? ai[i]!.tags!.slice(0, 2)
+        : next[i].tags,
+    };
+  }
+  return next;
+}
+
+function buildExecutionPlanFromOptions(options: DishOption[]): ExecutionPlan | null {
+  const primary = options?.[0];
+  if (!primary?.id) return null;
+
+  // Phase 1: we keep this minimal and "searchKey-first"
+  const searchKey = primary.searchKey || primary.title;
+  return {
+    version: 1,
+    primaryOptionId: primary.id,
+    steps: [{ type: "eatout_search", searchKey }],
+    disclosure: { shareMode: "qr_reserved", shareToken: null, expiresAt: null },
+  };
+}
+
+/* -------------------------------- Service -------------------------------- */
+
+export async function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: number }) {
   const ctx = getCtx(req);
   const db = getDb(req);
 
   const subjectMemberId = ctx.activeMemberId;
-  if (!ctx.allowedMemberIds.includes(subjectMemberId)) {
-    throw new Error("MEMBER_NOT_ALLOWED");
-  }
+  if (!ctx.allowedMemberIds.includes(subjectMemberId)) throw new Error("MEMBER_NOT_ALLOWED");
 
-  const anyReq = req as any;
-  anyReq.__homeAiUsed = anyReq.__homeAiUsed ?? false;
-  
-
-
-
-  // ---- Mode (compute once)
+  // ---- Mode
   const syncOn = isSyncEnabled(db, ctx.userId);
-  const syncMode = syncOn ? "sync" : "privacy";
+  const syncMode: "sync" | "privacy" = syncOn ? "sync" : "privacy";
 
   const userPrefs = syncOn ? readUserPrefsSyncOnly(db, ctx.userId) : null;
-  const localIntelOrNull = null; // keep local-only for now (frontend supplies later)
+  const localIntelOrNull = null;
 
-
-  // ---- Window query (your existing logic)
+  // ---- Window query
   const now = new Date();
   const toIso = now.toISOString();
-
   const fromIso =
     opts.window === "daily"
       ? startOfLocalDayIso(now)
@@ -402,28 +497,20 @@ export async function getHomeSummary(
     )
     .all(subjectMemberId, fromIso, toIso);
 
-  // ---- Normalize + compute hero score (NO intelligence in here)
+  // ---- Normalize + hero score
   const scores: number[] = [];
   const normalized = rows.map((r: any) => {
     const s = clampScore(r.score);
     if (s != null) scores.push(s);
-
-    return {
-      logId: r.logId,
-      capturedAt: r.capturedAt ?? null,
-      mealType: r.mealType ?? null,
-      summary: r.summary ?? null,
-      score: s,
-    };
+    return { logId: r.logId, capturedAt: r.capturedAt ?? null, mealType: r.mealType ?? null, summary: r.summary ?? null, score: s };
   });
 
   const hasData = scores.length > 0;
   const avgScore = hasData ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
   const status = statusForScore(avgScore, hasData);
 
-  // ---- 14d behavior query (ALWAYS 14d; run ONCE)
+  // ---- 14d behavior (always)
   const fromIso14d = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString();
-
   const rows14d = db
     .prepare(
       `
@@ -439,86 +526,135 @@ export async function getHomeSummary(
     )
     .all(subjectMemberId, fromIso14d, toIso);
 
-  const behavior14d = compute14DayBehavior(rows14d); // <-- from 14d rows ONLY
+  const behavior14d = compute14DayBehavior(rows14d);
 
-
-  
-
-  // ---- Daily-only intelligence
+  // ---- Daily intelligence only
   const profileSummary = buildProfileSummary({
     mode: syncMode,
     preferences: syncOn ? userPrefs : null,
     intel: localIntelOrNull,
-
   });
 
   const todayTotals = opts.window === "daily" ? computeTodayTotals(rows) : null;
 
   const vector =
     opts.window === "daily" && todayTotals
-      ? buildDailyVector2({
-          profile: profileSummary,
-          consumed: todayTotals,
-          behavior14d,
-        })
+      ? buildDailyVector2({ profile: profileSummary, consumed: todayTotals, behavior14d })
       : null;
 
+  // Legacy (optional) – keep for now for copy/text until UI switches fully
   const bestNextMeal =
     opts.window === "daily" && vector
-      ? getBestNextMealV2({
-          profile: profileSummary,
-          vector,
-          behavior14d,
-        })
+      ? getBestNextMealV2({ profile: profileSummary, vector, behavior14d })
       : null;
 
+  // --- Macro Gap Engine v1 (authoritative)
+  //const prefsKey = syncOn ? JSON.stringify(userPrefs?.cuisines ?? []) : "";
+  const prefsKey = syncOn ? prefsFingerprint(userPrefs) : "";
+  const day = startOfLocalDayIso(now).slice(0, 10);
+  const planCacheKey = `home_plan_v1:${ctx.userId}:${subjectMemberId}:${day}:${syncMode}:${prefsKey}`;
+  const cacheKey = `macro_v1:${ctx.userId}:${subjectMemberId}:${now.toISOString().slice(0,10)}:${syncMode}:${prefsKey}`;
+ 
 
-  // ---- AI dish ideas (Sync-only, daily-only, never blocks Home)
-  let dishIdeas: DishIdea[] | null = null;
-  let restaurantSearchKey: string | null = null;
+  type MacroPlanBundle = {
+    intent: any;        // BestNextMealIntent from macro-gap.ts
+    options: any[];     // DishOption from macro-gap.ts
+    plan: any;          // ExecutionPlan from macro-gap.ts
+    vector: any;        // DailyVector2
+  };
 
-  if (opts.window === "daily" && syncOn && bestNextMeal) {
+  let macroBundle: MacroPlanBundle | null =
+    opts.window === "daily" ? cacheGet<MacroPlanBundle>(planCacheKey) : null;
+
+  if (!macroBundle && opts.window === "daily" && profileSummary && todayTotals) {
+    const built = buildMacroGapExecutionPlan({
+      mode: syncMode,
+      profile: profileSummary,
+      consumed: todayTotals,
+      behavior14d,
+      ttlMinutes: 5,
+      maxOptions: 2,
+      now,
+    });
+
+    macroBundle = {
+      intent: built.intent,
+      plan: built.plan,
+      vector: built.vector,
+      options: built.options,
+    };
+
+    cacheSet(cacheKey, 5 * 60_000, macroBundle);
+  }
+
+
+  // Deterministic options now come from macro-gap module
+  const deterministicOptions: DishOption[] =
+    opts.window === "daily" && macroBundle?.options?.length
+      ? macroBundle.options.map((o: any, idx: number) => ({
+        id: `mg_${o.id || idx + 1}`,
+        title: o.title,
+        mode: o.executionHints?.channel === "home" ? "home" : "eatout",
+        searchKey: o.executionHints?.searchKey ?? o.title,
+        tags: Array.isArray(o.tags) ? o.tags.slice(0, 2) : [],
+        why: o.why ?? null,
+        confidence: typeof o.confidence === "number" ? o.confidence : null,
+      }))
+      : [];
+
+
+  // ---- AI refinement (Sync-only, daily-only, never blocks)
+  let refinedOptions = deterministicOptions;
+  let restaurantSearchKey: string | null = refinedOptions[0]?.searchKey ?? null;
+
+  if (opts.window === "daily" && syncOn && refinedOptions.length) {
+
     const guard = getHomeAiGuard(req);
-
-    // 1 call max per request (even if refactors call twice)
     if (!guard.used()) {
       guard.mark();
 
       const apiKey = process.env.OPENAI_API_KEY || "";
       const model = process.env.OPENAI_MODEL_HOME_IDEAS || "gpt-4o-mini";
 
-      // If no key, skip silently (Home must never break)
       if (apiKey) {
-        const timeWindow = "next meal";
-        const bullets = Array.isArray((bestNextMeal as any)?.meta?.bullets)
-          ? (bestNextMeal as any).meta.bullets.slice(0, 6)
-          : [];
+        const bullets =
+          Array.isArray((bestNextMeal as any)?.meta?.bullets)
+            ? (bestNextMeal as any).meta.bullets.slice(0, 6)
+            : [
+              macroBundle?.intent?.context?.macroGap?.summary?.proteinGap_g ? "Close protein gap" : "Balanced protein",
+              macroBundle?.intent?.context?.macroGap?.summary?.fiberGap_g ? "Add fiber" : "Add vegetables",
+              macroBundle?.intent?.context?.macroGap?.summary?.sodiumRisk === "high" ? "Keep sodium low" : "Watch sodium",
+              macroBundle?.intent?.context?.macroGap?.summary?.sugarRisk === "high" ? "Keep added sugar low" : "Avoid sweet drinks",
+            ].filter(Boolean).slice(0, 6);
 
-        // Light personalization from last logs
+
         const recentSummaries = rows
           .map((r: any) => (typeof r?.summary === "string" ? r.summary : ""))
           .filter(Boolean)
           .slice(0, 8);
 
         try {
-          const aiRaw = await withTimeout(
+          const ai = await withTimeout(
             generateDishIdeasAI({
               apiKey,
               model,
-              timeWindow,
               bullets,
               cuisineHint: behavior14d?.commonCuisine ?? null,
               recentSummaries,
-              modeLabel: "sync",
               aiPersonality: userPrefs?.aiPersonality ?? "straight",
             }),
-            1600 // hard cap: tune to taste
+            1600
           );
 
-          const sanitized = sanitizeIdeas(aiRaw);
-          if (sanitized) {
-            dishIdeas = sanitized.ideas;
-            restaurantSearchKey = sanitized.searchKey;
+          if (ai?.ideas?.length) {
+            refinedOptions = mergeAiIdeasIntoOptions(refinedOptions, ai.ideas);
+
+            // Keep authoritative plan aligned with refined primary option (Sync-only refinement)
+            if (opts.window === "daily" && macroBundle?.plan) {
+              macroBundle.plan = patchPlanSearchKeyFromRefined(macroBundle.plan, refinedOptions);
+            }
+
+            restaurantSearchKey = ai.searchKey || refinedOptions[0]?.searchKey || restaurantSearchKey;
           }
         } catch {
           // swallow: Home must never block
@@ -527,25 +663,21 @@ export async function getHomeSummary(
     }
   }
 
-      
-      // fallback (still premium) if AI fails
-      if (opts.window === "daily" && !dishIdeas && bestNextMeal) {
-        dishIdeas = [
-          { title: "Grilled chicken bowl", query: "grilled chicken bowl", tags: ["Build"] },
-          { title: "Greek salad + chicken", query: "greek chicken chicken salad", tags: ["Build"] },
-          { title: "Salmon + veggies", query: "salmon vegetables", tags: ["Great"] },
-        ];
-        restaurantSearchKey = dishIdeas[0].query;
-      }
-      
+  // ---- Fallback if no AI + no deterministic (shouldn't happen, but safe)
+  if (opts.window === "daily" && bestNextMeal && (!refinedOptions || !refinedOptions.length)) {
+    refinedOptions = buildDeterministicOptions({
+      bestTitle: bestNextMeal.title,
+      cuisineHint: behavior14d?.commonCuisine ?? null,
+      deficitText: vector?.deficitOfDay?.text ?? null,
+    });
+    restaurantSearchKey = refinedOptions[0]?.searchKey ?? restaurantSearchKey;
+  }
+
+  const intent = opts.window === "daily" ? (macroBundle?.intent ?? null) : null;
+  const executionPlan = opts.window === "daily" ? (macroBundle?.plan ?? null) : null;
 
 
-
-
-
-
-
-  // ---- Home payload fields
+  // ---- UI payload fields
   let todaysFocus: any = null;
   let suggestion: any = null;
 
@@ -559,47 +691,52 @@ export async function getHomeSummary(
       totals: todayTotals,
     };
 
-
-
     const countedRowsToday =
-    opts.window === "daily"
-      ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length
-      : 0;
+      opts.window === "daily" ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length : 0;
 
-  const totalRowsToday = opts.window === "daily" ? rows.length : 0;
+    const totalRowsToday = opts.window === "daily" ? rows.length : 0;
+    const estimateCoverage = totalRowsToday > 0 ? countedRowsToday / totalRowsToday : 0;
 
-  const estimateCoverage =
-    totalRowsToday > 0 ? countedRowsToday / totalRowsToday : 0;
+    const behaviorConfidence = behavior14d ? 1 : 0;
+    const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
+    const confidenceLabel = suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
 
-  const behaviorConfidence = behavior14d ? 1 : 0;
-  const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
+    // Prefer plan’s primary action searchKey (authoritative), fallback to refined option
+    const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
 
 
-  const confidenceLabel =
-  suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
+    suggestion =
+      refinedOptions.length
+        ? {
+          title: bestNextMeal?.title ?? refinedOptions[0]?.title ?? "Best Next Meal",
+          suggestionText: bestNextMeal?.suggestionText ?? refinedOptions[0]?.why ?? null,
+          contextNote: bestNextMeal?.contextNote ?? null,
 
-suggestion = bestNextMeal
-  ? {
-      title: bestNextMeal.title,
-      suggestionText: bestNextMeal.suggestionText,
-      contextNote: bestNextMeal.contextNote ?? null,
+          confidence: suggestionConfidence,
+          confidenceLabel,
 
-      confidence: suggestionConfidence,       // 0..1
-      confidenceLabel,                        // "low" | "medium" | "high"
-      dishIdeas: dishIdeas ?? [],
+          dishIdeas: refinedOptions.map((o) => ({
+            title: o.title,
+            query: o.searchKey ?? o.title,
+            tags: o.tags ?? [],
+          })),
 
-      route: {
-        tab: "eat-out",                        // IMPORTANT: match frontend
-        searchKey: restaurantSearchKey ?? "",
-      },
-    }
-  : null;
+          // intent-first objects (authoritative)
+          intent,
+          executionPlan,
+
+          // keep current routing field alive for current EatOut
+          route: { searchKey: planSearchKey ?? refinedOptions[0]?.searchKey ?? restaurantSearchKey ?? "" },
+        }
+        : null;
+
+
   }
 
   return {
     meta: {
       window: opts.window,
-      generatedAt: new Date().toISOString(),
+      generatedAt: now.toISOString(),
       syncMode,
       mode: "individual",
       subjectMemberId,
@@ -622,17 +759,9 @@ suggestion = bestNextMeal
       primaryCta: { id: "scan_food", title: "Scan Food", subtitle: null },
       secondaryCta: { id: "find_restaurant", title: "Find Restaurant", subtitle: null },
     },
-
-    // ✅ return the object (premium UI)
     todaysFocus,
-
-    // ✅ only present for daily
-    todayTotals,
-
+    todayTotals, // keep
     suggestion,
-    recentLogs: {
-      items: normalized.slice(0, opts.limit),
-    },
+    recentLogs: { items: normalized.slice(0, opts.limit) },
   };
 }
-
