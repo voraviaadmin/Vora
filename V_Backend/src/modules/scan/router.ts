@@ -7,7 +7,7 @@ import { requireSyncMode, apiOk, apiErr } from "../../middleware/resolveContext"
 import { getSyncPreferences } from "../restaurants/preferences";
 
 // ✅ Canonical scorer
-import { openAiScoreOneItem } from "../ai/openai-score";
+import { openAiScoreOneItem, openAiScorePlateV2,openAiScoreFullPlate , openAiScorePlateVision, openAiVisionPreflight} from "../ai/openai-score";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -143,6 +143,43 @@ scanRouter.post("/analyze", async (req, res) => {
   }
 });
 
+
+syncScanRouter.post(
+  "/score-plate-vision-v2",
+  requireSyncMode(),
+  upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),
+  async (req: any, res: any) => {
+    try {
+      const files = req.files as any;
+      const f = files?.file?.[0] ?? files?.image?.[0];
+      if (!f?.buffer) return res.status(400).json(apiErr(req, "MISSING_IMAGE", "No photo provided.", "Take a photo and try again.", 400, true).body);
+
+      const mime = (f.mimetype ?? "").toLowerCase();
+      const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+      if (!allowed.has(mime)) return res.status(415).json(apiErr(req, "UNSUPPORTED_MEDIA_TYPE", "Unsupported image type.", "Use JPG/PNG/WebP.", 415, true).body);
+
+      const prefs = getSyncPreferences(req);
+
+      const plate = await openAiScorePlateVision({
+        source: "scan",
+        imageBuffer: f.buffer,
+        mime,
+        detectedText: null,
+        cuisine: null,
+        mealType: null,
+        userPreferences: prefs,
+      });
+
+      return res.json(apiOk(req, { kind: "plate_v2", plate }));
+    } catch (e: any) {
+      const r = apiErr(req, "SYNC_PLATE_VISION_FAILED", "Could not score plate.", "Try again.", 500, true);
+      return res.status(r.status).json({ ...r.body, debug: { message: e?.message ?? "unknown" } });
+    }
+  }
+);
+
+
+
 const syncScanVisionScoreHandler = async (req: any, res: any) => {
   try {
     const files = req.files as any;
@@ -162,26 +199,64 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
 
     const prefs = getSyncPreferences(req);
 
+    // ✅ Cost win: normalize image before ANY OpenAI call
+    const normalized = await sharp(f.buffer)
+      .rotate()
+      .resize({ width: 1024, withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    // ✅ Stage 1: cheap preflight (no prefs)
+    const pre = await openAiVisionPreflight({
+      imageBuffer: normalized,
+      mime: "image/jpeg", // because we converted to jpeg
+    });
+
+    const kind = pre?.kind ?? "uncertain";
+
+    // ✅ Default behavior: if uncertain, choose plate (safer UX)
+    const shouldPlate = kind === "plate" || kind === "uncertain";
+
+    if (shouldPlate) {
+      const plate = await openAiScorePlateV2({
+        source: "scan",
+        imageBuffer: normalized,
+        mime: "image/jpeg",
+        detectedText: null,
+        cuisine: null,
+        mealType: null,
+        userPreferences: prefs,
+      });
+
+      return res.json(
+        apiOk(req, {
+          kind: "plate_v2",
+          plate,
+          overall: plate.overall,
+          totalMealNutrition: plate.totalMealNutrition,
+          debug: { preflight: pre }, // optional, remove later
+        })
+      );
+    }
+
+    // ✅ Single-item path (cheaper)
     const out = await openAiScoreOneItem({
       source: "scan",
       mode: "vision",
-      imageBuffer: f.buffer,
-      mime,
+      imageBuffer: normalized,
+      mime: "image/jpeg",
       detectedText: null,
       cuisine: null,
       mealType: null,
       userPreferences: prefs,
     });
-    
-    // Vision returns wrapper
-    const { itemName, scoringJson } = out as any;
-    
 
-    console.log("Router itemName", itemName);
+    const { itemName, scoringJson } = out as any;
 
     return res.json(
       apiOk(req, {
-        itemName, // ✅ from wrapper
+        kind: "item_v1",
+        itemName,
         scoring: {
           score: scoringJson.score,
           label: scoringJson.label,
@@ -190,14 +265,15 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
           flags: scoringJson.flags,
         },
         scoringJson,
+        debug: { preflight: pre }, // optional, remove later
       })
     );
-    
   } catch (e) {
     const r = apiErr(req, "SYNC_VISION_SCORE_FAILED", "Could not score photo.", "Try again.", 500, true);
     return res.status(r.status).json({ ...r.body, debug: { message: (e as Error)?.message ?? "unknown" } });
   }
 };
+
 
 
 const syncScanScoreHandler = async (req: any, res: any) => {
@@ -253,6 +329,44 @@ const syncScanScoreHandler = async (req: any, res: any) => {
   }
 };
 
+const syncScanPlateScoreHandler = async (req: any, res: any) => {
+  try {
+    const files = req.files as any;
+    const f = files?.file?.[0] ?? files?.image?.[0];
+
+    if (!f?.buffer) {
+      const r = apiErr(req, "MISSING_IMAGE", "No photo provided.", "Take a photo and try again.", 400, true);
+      return res.status(r.status).json(r.body);
+    }
+
+    const mime = (f.mimetype ?? "").toLowerCase();
+    const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+    if (!allowed.has(mime)) {
+      const r = apiErr(req, "UNSUPPORTED_MEDIA_TYPE", "Unsupported image type.", "Use JPG/PNG/WebP.", 415, true);
+      return res.status(r.status).json(r.body);
+    }
+
+    const prefs = getSyncPreferences(req);
+
+    const plate = await openAiScoreFullPlate({
+      source: "scan",
+      mode: "vision_plate",
+      imageBuffer: f.buffer,
+      mime,
+      detectedText: null,
+      cuisine: null,
+      mealType: null,
+      userPreferences: prefs,
+    });
+
+    return res.json(apiOk(req, { kind: "plate_v2", plate }));
+  } catch (e: any) {
+    const r = apiErr(req, "SYNC_PLATE_SCORE_FAILED", "Could not score full plate.", "Try again.", 500, true);
+    return res.status(r.status).json({ ...r.body, debug: { message: e?.message ?? "unknown" } });
+  }
+};
+
+
 
 
 /**
@@ -262,5 +376,11 @@ const syncScanScoreHandler = async (req: any, res: any) => {
  */
 syncScanRouter.post("/score-v1", requireSyncMode(), syncScanScoreHandler);
 syncScanRouter.post("/score", requireSyncMode(), syncScanScoreHandler);
-syncScanRouter.post(  "/score-vision-v1",  requireSyncMode(),  upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),  syncScanVisionScoreHandler);
+syncScanRouter.post("/score-vision-v1", requireSyncMode(), upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]), syncScanVisionScoreHandler);
+syncScanRouter.post(
+  "/score-plate-v1",
+  requireSyncMode(),
+  upload.fields([{ name: "file", maxCount: 1 }, { name: "image", maxCount: 1 }]),
+  syncScanPlateScoreHandler
+);
 

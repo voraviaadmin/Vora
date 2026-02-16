@@ -106,6 +106,85 @@ export async function openAiScoreManyText(args: CommonArgs & { items: Array<{ na
   return out;
 }
 
+export async function openAiScorePlateV2(args: CommonArgs & {
+  imageBuffer: Buffer;
+  mime: string;
+  detectedText?: string | null;
+}): Promise<PlateScoreJsonV2> {
+  const apiKey = requireOpenAIKey();
+  const model = args.model ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+  const b64 = args.imageBuffer.toString("base64");
+
+  const prompt = buildPlateVisionPrompt({
+    detectedText: args.detectedText ?? null,
+    cuisine: args.cuisine ?? null,
+    mealType: args.mealType ?? null,
+    userPreferences: args.userPreferences ?? null,
+  });
+
+  const json = await callOpenAIVisionJson({
+    apiKey,
+    model,
+    prompt,
+    mime: args.mime,
+    imageDataUrl: `data:${args.mime};base64,${b64}`,
+    maxOutputTokens: 1600, // plate needs more room
+  });
+
+  // ✅ strongly recommended: validate shape with zod
+  const PlateSchema = z.object({
+    items: z.array(z.object({
+      itemName: z.string(),
+      description: z.string().nullable(),
+      portion: z.object({ grams: z.number().nullable(), serving: z.string() }),
+      confidence: z.number(),
+      scoring: z.object({
+        score: z.number(),
+        label: z.enum(["Good", "Ok", "Not Preferred"]),
+        why: z.string(),
+        reasons: z.array(z.string()),
+        flags: z.array(z.string()),
+        nutritionNotes: z.string().nullable(),
+        estimates: z.object({
+          calories: z.number().nullable(),
+          protein_g: z.number().nullable(),
+          carbs_g: z.number().nullable(),
+          fat_g: z.number().nullable(),
+          fiber_g: z.number().nullable(),
+          sugar_g: z.number().nullable(),
+          sodium_mg: z.number().nullable(),
+        }),
+        features: z.object({
+          cuisineMatch: z.enum(["high", "medium", "low"]),
+          goalAlignment: z.enum(["high", "medium", "low"]),
+          healthRisk: z.enum(["low", "medium", "high"]),
+          satiety: z.enum(["low", "medium", "high"]),
+        }),
+      }),
+    })),
+    totalMealNutrition: z.object({
+      calories: z.number().nullable(),
+      protein_g: z.number().nullable(),
+      carbs_g: z.number().nullable(),
+      fat_g: z.number().nullable(),
+      fiber_g: z.number().nullable(),
+      sugar_g: z.number().nullable(),
+      sodium_mg: z.number().nullable(),
+    }),
+    overall: z.object({
+      score: z.number(),
+      label: z.enum(["Good", "Ok", "Not Preferred"]),
+      why: z.string(),
+      flags: z.array(z.string()),
+    }),
+  });
+
+  return PlateSchema.parse(json) as PlateScoreJsonV2;
+}
+
+
+
 /* -----------------------------------------
  * Internal specialized scorers (do not import
  * directly from routers)
@@ -191,6 +270,34 @@ async function scoreVisionOne(
 }
 
 
+async function scoreVisionPlateV2(
+  args: CommonArgs & { mode: "vision"; imageBuffer: Buffer; mime: string; detectedText?: string | null }
+): Promise<PlateScoreJsonV2> {
+  const apiKey = requireOpenAIKey();
+  const model = args.model ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+  const b64 = args.imageBuffer.toString("base64");
+
+  const prompt = buildPlateVisionPrompt({
+    detectedText: args.detectedText ?? null,
+    cuisine: args.cuisine ?? null,
+    mealType: args.mealType ?? null,
+    userPreferences: args.userPreferences ?? null,
+  });
+
+  const json = await callOpenAIVisionJson({
+    apiKey,
+    model,
+    prompt,
+    mime: args.mime,
+    imageDataUrl: `data:${args.mime};base64,${b64}`,
+    maxOutputTokens: 1800,
+  });
+
+  return PlateScoreJsonV2Schema.parse(json);
+}
+
+
 /* -----------------------
  * Prompt builders
  * ----------------------- */
@@ -244,6 +351,124 @@ export type PlateScoreJsonV2 = {
     flags: string[];
   };
 };
+
+
+const PlateScoreJsonV2Schema = z.object({
+  items: z.array(z.object({
+    itemName: z.string().min(1),
+    description: z.string().nullable(),
+    portion: z.object({
+      grams: z.number().nullable(),
+      serving: z.string().min(1),
+    }),
+    confidence: z.number().min(0).max(1),
+    scoring: z.object({
+      score: z.number().min(0).max(100),
+      label: z.enum(["Good", "Ok", "Not Preferred"]),
+      why: z.string(),
+      reasons: z.array(z.string()),
+      flags: z.array(z.string()),
+      nutritionNotes: z.string().nullable(),
+      estimates: z.object({
+        calories: z.number().nullable(),
+        protein_g: z.number().nullable(),
+        carbs_g: z.number().nullable(),
+        fat_g: z.number().nullable(),
+        fiber_g: z.number().nullable(),
+        sugar_g: z.number().nullable(),
+        sodium_mg: z.number().nullable(),
+      }),
+      features: z.object({
+        cuisineMatch: z.enum(["high", "medium", "low"]),
+        goalAlignment: z.enum(["high", "medium", "low"]),
+        healthRisk: z.enum(["low", "medium", "high"]),
+        satiety: z.enum(["low", "medium", "high"]),
+      }),
+    }),
+  })),
+  totalMealNutrition: z.object({
+    calories: z.number().nullable(),
+    protein_g: z.number().nullable(),
+    carbs_g: z.number().nullable(),
+    fat_g: z.number().nullable(),
+    fiber_g: z.number().nullable(),
+    sugar_g: z.number().nullable(),
+    sodium_mg: z.number().nullable(),
+  }),
+  overall: z.object({
+    score: z.number().min(0).max(100),
+    label: z.enum(["Good", "Ok", "Not Preferred"]),
+    why: z.string(),
+    flags: z.array(z.string()),
+  }),
+});
+
+
+export async function openAiScoreFullPlate(
+  args: CommonArgs & {
+    mode: "vision_plate";
+    imageBuffer: Buffer;
+    mime: string;
+    detectedText?: string | null;
+  }
+): Promise<PlateScoreJsonV2> {
+  const apiKey = requireOpenAIKey();
+  const model = args.model ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+  const b64 = args.imageBuffer.toString("base64");
+
+  const prompt = buildPlateVisionPrompt({
+    detectedText: args.detectedText ?? null,
+    cuisine: args.cuisine ?? null,
+    mealType: args.mealType ?? null,
+    userPreferences: args.userPreferences ?? null,
+  });
+
+  const json = await callOpenAIVisionJson({
+    apiKey,
+    model,
+    prompt,
+    mime: args.mime,
+    imageDataUrl: `data:${args.mime};base64,${b64}`,
+    maxOutputTokens: 2000,
+  });
+
+  // Enforce strict contract
+  return PlateScoreJsonV2Schema.parse(json) as PlateScoreJsonV2;
+}
+
+
+export async function openAiScorePlateVision(
+  args: CommonArgs & {
+    imageBuffer: Buffer;
+    mime: string;
+    detectedText?: string | null;
+  }
+): Promise<PlateScoreJsonV2> {
+  const apiKey = requireOpenAIKey();
+  const model = args.model ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+  const b64 = args.imageBuffer.toString("base64");
+
+  const prompt = buildPlateVisionPrompt({
+    detectedText: args.detectedText ?? null,
+    cuisine: args.cuisine ?? null,
+    mealType: args.mealType ?? null,
+    userPreferences: args.userPreferences ?? null,
+  });
+
+  const json = await callOpenAIVisionJson({
+    apiKey,
+    model,
+    prompt,
+    mime: args.mime,
+    imageDataUrl: `data:${args.mime};base64,${b64}`,
+    maxOutputTokens: 2000,
+  });
+
+  // TODO: strongly recommended: validate with zod schema for PlateScoreJsonV2
+  return json as PlateScoreJsonV2;
+}
 
 
 function buildTextPrompt(args: {
@@ -448,6 +673,71 @@ Rules:
 - flags max 8 per item; overall.flags max 8.
 `.trim();
 }
+
+
+
+function buildVisionPreflightPrompt(): string {
+  return `
+Decide if the image shows a SINGLE main food item or a FULL PLATE with MULTIPLE items.
+
+Return JSON only:
+{
+  "kind": "single" | "plate" | "uncertain",
+  "reason": "short",
+  "itemHint": string|null
+}
+
+Rules:
+- "single" = one dominant item (e.g., burger, bowl, sandwich) with maybe minor garnish.
+- "plate" = multiple distinct items/sides (e.g., rice + curry + roti + salad).
+- If not sure, return "uncertain".
+- itemHint is a 2-4 word guess only when kind="single".
+`.trim();
+}
+
+
+export async function openAiVisionPreflight(args: {
+  imageBuffer: Buffer;
+  mime: string;
+  model?: string;
+}): Promise<{ kind: "single" | "plate" | "uncertain"; reason?: string; itemHint?: string | null }> {
+  const apiKey = requireOpenAIKey();
+  const model = args.model ?? process.env.OPENAI_VISION_PREFLIGHT_MODEL ?? process.env.OPENAI_VISION_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+  const b64 = args.imageBuffer.toString("base64");
+  const prompt = `
+Decide if the image shows a SINGLE main food item or a FULL PLATE with MULTIPLE items.
+
+Return JSON only:
+{ "kind":"single"|"plate"|"uncertain", "reason":"short", "itemHint":string|null }
+
+Rules:
+- "single" = one dominant item (burger, bowl, sandwich) with maybe garnish.
+- "plate" = multiple distinct items/sides (rice + curry + roti + salad).
+- If not sure, "uncertain".
+- itemHint only when kind="single" (2-4 words).
+`.trim();
+
+  const json = await callOpenAIVisionJson({
+    apiKey,
+    model,
+    prompt,
+    mime: args.mime,
+    imageDataUrl: `data:${args.mime};base64,${b64}`,
+    maxOutputTokens: 180,
+  });
+
+  const PreflightSchema = z.object({
+    kind: z.enum(["single", "plate", "uncertain"]),
+    reason: z.string().optional(),
+    itemHint: z.string().nullable().optional(),
+  });
+
+  return PreflightSchema.parse(json);
+}
+
+
+
 
 /* -----------------------
  * OpenAI callers
