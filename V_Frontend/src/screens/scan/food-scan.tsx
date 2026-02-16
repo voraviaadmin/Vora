@@ -140,6 +140,19 @@ function cleanLogSummary(raw: string, mode: "sync" | "privacy") {
 }
 
 
+// put these helpers near the top of the file (outside component)
+function normName(s: any) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function titleCase(s: string) {
+  return s.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+
 
 export default function FoodScanScreen() {
   const params = useLocalSearchParams<{ mealType?: string; start?: string }>();
@@ -296,7 +309,7 @@ export default function FoodScanScreen() {
 
 
       let data: any = null;
-      
+
       try {
         data = await scoreVisionV1(photoUri!, "sync");
         console.log("VISION scoreVisionV1 returned ✅");
@@ -313,7 +326,7 @@ export default function FoodScanScreen() {
         }
         throw e;
       }
-      
+
       console.log("VISION RAW (post-await):", data);
       // ✅ Canonical unwrap for all variants:
       // - fetch wrapper: { data: ... }
@@ -377,7 +390,7 @@ export default function FoodScanScreen() {
       setPreview(payload);
       setInlineError(null);
       return;
-      
+
 
     }
 
@@ -494,6 +507,70 @@ export default function FoodScanScreen() {
     const rawText = itemsText.trim();
     const text = cleanLogSummary(rawText, mode);
 
+
+    const EST_KEYS = [
+      "calories",
+      "protein_g",
+      "carbs_g",
+      "fat_g",
+      "fiber_g",
+      "sugar_g",
+      "sodium_mg",
+    ] as const;
+    
+    type EstKey = (typeof EST_KEYS)[number];
+    
+    function n(v: any): number {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : 0;
+    }
+    
+    function normalizeItemKey(name: string) {
+      return String(name ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+    }
+    
+    function sumEstimates(items: any[]) {
+      const out: Record<EstKey, number> = {
+        calories: 0,
+        protein_g: 0,
+        carbs_g: 0,
+        fat_g: 0,
+        fiber_g: 0,
+        sugar_g: 0,
+        sodium_mg: 0,
+      };
+    
+      for (const it of items) {
+        const est = it?.scoring?.estimates ?? {};
+        for (const k of EST_KEYS) out[k] += n(est[k]);
+      }
+    
+      // Optional: keep 1 decimal for grams, whole for calories/sodium
+      out.calories = Math.round(out.calories);
+      out.sodium_mg = Math.round(out.sodium_mg);
+    
+      out.protein_g = Math.round(out.protein_g * 10) / 10;
+      out.carbs_g = Math.round(out.carbs_g * 10) / 10;
+      out.fat_g = Math.round(out.fat_g * 10) / 10;
+      out.fiber_g = Math.round(out.fiber_g * 10) / 10;
+      out.sugar_g = Math.round(out.sugar_g * 10) / 10;
+    
+      return out;
+    }
+    
+    function avgScore(items: any[]) {
+      const vals = items.map(it => n(it?.scoring?.score)).filter(v => v > 0);
+      if (!vals.length) return null;
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      return Math.round(avg);
+    }
+    
+
+
+
     const fallbackSummary = (preview as any)?.itemName || (preview as any)?.plate?.overall?.why || "";
     if (text.length < 2 && !fallbackSummary) {
       Alert.alert(
@@ -568,81 +645,70 @@ export default function FoodScanScreen() {
       }
 
       // ☁️ SYNC MODE (existing behavior)
-
-      if ((p as any)?.kind === "plate_v2") {
+      // ✅ If plate_v2, group items and save multiple logs (one per itemName)
+      if (mode === "sync" && p && (p as any).kind === "plate_v2") {
         const plate = p as any;
-      
-        const items: any[] = Array.isArray(plate.items) ? plate.items : [];
-        if (!items.length) {
-          Alert.alert("Save log", "No items to save from this plate.");
+
+       /* const items: any[] = Array.isArray(plate.items) ? plate.items : [];
+        if (items.length === 0) {
+          Alert.alert("Save log", "No items detected to save.");
           return;
+        }*/
+
+        const plateItems = (preview as any)?.plate?.items ?? (preview as any)?.items ?? [];
+        const groups = new Map<string, { name: string; items: any[] }>();
+        
+        for (const it of plateItems) {
+          const name = String(it?.itemName ?? "Item").trim() || "Item";
+          const key = normalizeItemKey(name);
+          const g = groups.get(key) ?? { name, items: [] };
+          g.items.push(it);
+          groups.set(key, g);
         }
-      
-        // Save EACH item as its own log (fastest fix without backend changes)
-        // Optional: you can also create an extra “plate summary” log later if you want.
-        const results = [];
-      
-        for (const it of items) {
-          const scoringJson = it?.scoring ?? null;
-          const score = scoringJson?.score ?? null;
-          const itemName = String(it?.itemName ?? "").trim() || "Plate item";
-      
-          if (!scoringJson || score == null) {
-            console.warn("Skipping item without scoring:", it?.itemName);
-            continue;
-          }
-      
-          const out = await createMealLog(
+
+        for (const g of groups.values()) {
+          const count = g.items.length;
+        
+          const score = avgScore(g.items);                 // ✅ average
+          const estimates = sumEstimates(g.items);         // ✅ sum
+        
+          // choose a “representative” scoringJson to preserve label/why/reasons/flags
+          const rep = g.items.find(x => x?.scoring)?.scoring ?? null;
+        
+          const scoringJson = rep
+            ? {
+                ...rep,
+                score: score ?? rep.score,
+                estimates: { ...(rep.estimates ?? {}), ...estimates },
+              }
+            : {
+                score: score ?? 0,
+                label: "Ok",
+                why: "",
+                reasons: [],
+                flags: [],
+                estimates,
+              };
+        
+          const summary = count > 1 ? `${g.name} x${count}` : g.name;
+        
+          await createMealLog(
             {
-              summary: itemName,
+              summary,
               capturedAt: new Date().toISOString(),
               mealType,
-              score,
+              score: scoringJson.score,
               scoringJson,
             },
-            { mode }
+            { mode: "sync" }
           );
-      
-          results.push(out);
         }
-      
+
         invalidateHomeSummary();
-        Alert.alert("Saved", `Saved ${results.length} items from plate.`);
-        return;
+        Alert.alert("Saved", `Saved ${groups.size} item logs from plate.`);
+        return; // ✅ IMPORTANT: stop here so we don’t also run the single-item save below
+
       }
-      
-      // ✅ Single-item (existing behavior)
-      const scoringJson = (p as any).scoringJson;
-      const score = scoringJson?.score ?? null;
-      const itemName = (p as any)?.itemName ?? null;
-      
-      const cleanText = String(text ?? "").trim();
-      const safeSummary =
-        String(itemName ?? "").trim()
-          ? String(itemName).trim()
-          : cleanText
-            ? cleanText
-            : "Food entry";
-      
-      const out = await createMealLog(
-        {
-          summary: safeSummary,
-          capturedAt: new Date().toISOString(),
-          mealType,
-          score,
-          scoringJson,
-        },
-        { mode }
-      );
-
-      if ("logId" in out) {
-        invalidateHomeSummary();
-        Alert.alert("Saved", `Log saved (${out.logId}).`);
-      } else {
-        setInlineError((out as any).reason ?? "Save failed.");
-      }
-
-
 
     } catch (e: any) {
       setInlineError(e?.message ?? "Failed to save.");
@@ -651,13 +717,6 @@ export default function FoodScanScreen() {
     }
 
 
-
-
-
-
-
-
-    
   }
 
 
