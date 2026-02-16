@@ -492,7 +492,7 @@ function buildTextPrompt(args: {
   cuisine: string | null;
   mealType: string | null;
   userPreferences: unknown;
-  dayContext: unknown;
+  dayContext?: unknown | null;
 }): string {
   return `
 Score ONE ${args.source === "menu" ? "restaurant menu item" : "scanned food item"} for a user.
@@ -515,6 +515,12 @@ Scoring rules:
   - If sodiumRisk is high → penalize high sodium harder
   - If sugarRisk is high → penalize added sugar harder
   - If caloriesRemaining is low → penalize calorie-dense items harder
+  - CuisineMatch guidance:
+  - If cuisine is "unknown" OR the item is a generic whole food (fruit, eggs, plain yogurt, plain oats, water, etc.), set features.cuisineMatch="low" unless the cuisine is explicitly indicated by name/ingredients.
+- Day-context guidance:
+  - If dayContext.macroGapSummary indicates proteinGap_g high, prefer higher protein in scoring and in reasons.
+  - If sodiumRisk or sugarRisk is "high", penalize sodium/sugar more and include a flag when clearly applicable.
+
 
 Return STRICT JSON only with EXACT keys:
 {
@@ -576,6 +582,11 @@ Context:
 Task:
 - Identify the most likely single food item shown (or described by detectedText).
 - Score it for the user's health goal and preferences.
+CuisineMatch guidance:
+- If cuisine is unknown OR the item is a generic whole food (fruit, eggs, plain yogurt, etc.), set cuisineMatch="low" unless cuisine is clearly indicated.
+Day-context guidance:
+- Use dayContext.macroGapSummary to weight scoring (protein gap, sugar/sodium risk, calories remaining).
+
 
 Return JSON only in this exact format:
 
@@ -650,6 +661,10 @@ Requirements (must follow):
    - include confidence (0..1) per item
    - if uncertain, set nutrition fields to null and lower confidence
    - do NOT hallucinate brand names
+
+CuisineMatch rule:
+- If cuisine is unknown OR an item is a generic whole food (fruit, plain salad, steamed veg), set that item scoring.features.cuisineMatch="low" unless cuisine is clearly indicated.
+
 
 Return STRICT JSON only with EXACT keys and structure:
 

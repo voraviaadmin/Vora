@@ -13,8 +13,10 @@ export const EstimatesSchema = z.object({
   protein_g: z.number().nullable(),
   carbs_g: z.number().nullable(),
   fat_g: z.number().nullable(),
+  fiber_g: z.number().nullable(),
   sugar_g: z.number().nullable(),
   sodium_mg: z.number().nullable(),
+
 });
 
 export const FeaturesSchema = z
