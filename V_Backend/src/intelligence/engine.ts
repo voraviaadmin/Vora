@@ -85,6 +85,8 @@ export type DailyTargets = {
   sugar_g_max: number;
   sodium_mg_max: number;
   fiber_g_min: number;
+  carbs_g_min: number;
+  fat_g_min: number;
 };
 
 export type DailyConsumed = {
@@ -93,6 +95,8 @@ export type DailyConsumed = {
   sugar_g: number;
   sodium_mg: number;
   fiber_g: number;
+  carbs_g: number;
+  fat_g: number;
 };
 
 export type DailyRemaining = {
@@ -101,6 +105,8 @@ export type DailyRemaining = {
   sugar_g: number;
   sodium_mg: number;
   fiber_g: number;
+  carbs_g: number;
+  fat_g: number;
 };
 
 // --- UPDATE: DailyVector2 (add behavior hint, keep minimal) ---
@@ -151,6 +157,8 @@ export type IntelligenceConfig = {
     sugar_g_max: number;
     sodium_mg_max: number;
     fiber_g_min: number;
+    carbs_g_min: number;
+    fat_g_min: number;
   };
 
   multipliers: {
@@ -163,6 +171,9 @@ export type IntelligenceConfig = {
     fiberDeficit_g: number;
     sodiumRisk_pct: number;
     sugarRisk_pct: number;
+    carbsRisk_pct: number;
+    fatRisk_pct: number;
+    fiberRisk_pct: number;
 
     // NEW: make the engine more sensitive if user repeatedly overshoots
     behaviorSodiumSensitivityBoost: number; // e.g. 0.1 => risk triggers 10% earlier
@@ -182,6 +193,8 @@ export const DEFAULT_INTELLIGENCE_CONFIG: IntelligenceConfig = {
     sugar_g_max: 40,
     sodium_mg_max: 2300,
     fiber_g_min: 28,
+    carbs_g_min: 28,
+    fat_g_min: 28,
   },
   multipliers: {
     goalIntensity: {
@@ -200,7 +213,9 @@ export const DEFAULT_INTELLIGENCE_CONFIG: IntelligenceConfig = {
     fiberDeficit_g: 8,
     sodiumRisk_pct: 0.8,
     sugarRisk_pct: 0.8,
-
+    carbsRisk_pct: 0.8,
+    fatRisk_pct: 0.8,
+    fiberRisk_pct: 0.8,
     behaviorSodiumSensitivityBoost: 0.1,
     behaviorProteinSensitivityBoost_g: 10,
   },
@@ -276,7 +291,9 @@ export function buildDailyVector2(input: {
   const sugarMax = config.targets.sugar_g_max;
   const sodiumMax = config.targets.sodium_mg_max;
   const fiberMin = config.targets.fiber_g_min;
-
+  const carbsMin = config.targets.carbs_g_min;
+  const fatMin = config.targets.fat_g_min;
+  
   const gi = input.profile.derived.goalIntensity;
   const al = input.profile.derived.activityLevel;
 
@@ -297,6 +314,8 @@ export function buildDailyVector2(input: {
     sugar_g_max: input.targetsOverride?.sugar_g_max ?? sugarMax,
     sodium_mg_max: input.targetsOverride?.sodium_mg_max ?? sodiumMax,
     fiber_g_min: input.targetsOverride?.fiber_g_min ?? fiberMin,
+    carbs_g_min: input.targetsOverride?.carbs_g_min ?? carbsMin,
+    fat_g_min: input.targetsOverride?.fat_g_min ?? fatMin,
   };
 
   const consumed: DailyConsumed = {
@@ -305,6 +324,8 @@ export function buildDailyVector2(input: {
     sugar_g: clampNum(input.consumed?.sugar_g ?? 0),
     sodium_mg: clampNum(input.consumed?.sodium_mg ?? 0),
     fiber_g: clampNum(input.consumed?.fiber_g ?? 0),
+    carbs_g: clampNum(input.consumed?.carbs_g ?? 0),
+    fat_g: clampNum(input.consumed?.fat_g ?? 0),
   };
 
   const remaining: DailyRemaining = {
@@ -313,6 +334,8 @@ export function buildDailyVector2(input: {
     sugar_g: Math.max(0, targets.sugar_g_max - consumed.sugar_g),
     sodium_mg: Math.max(0, targets.sodium_mg_max - consumed.sodium_mg),
     fiber_g: Math.max(0, targets.fiber_g_min - consumed.fiber_g),
+    carbs_g: Math.max(0, targets.carbs_g_min - consumed.carbs_g),
+    fat_g: Math.max(0, targets.fat_g_min - consumed.fat_g),
   };
 
   // NEW: behavior-aware sensitivity (still minimal, still centralized)

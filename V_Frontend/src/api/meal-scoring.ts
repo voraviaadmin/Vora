@@ -32,6 +32,7 @@ export type AiScoringJson = {
     fat_g: number | null;
     sugar_g: number | null;
     sodium_mg: number | null;
+    fiber_g: number | null;
   };
   features?: {
     cuisineMatch?: "high" | "medium" | "low";

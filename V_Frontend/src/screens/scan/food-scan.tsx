@@ -350,6 +350,7 @@ export default function FoodScanScreen() {
               fat_g: null,
               sugar_g: null,
               sodium_mg: null,
+              fiber_g: null,
             },
           },
         };

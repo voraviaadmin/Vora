@@ -1,6 +1,9 @@
 import type { Request, Response, NextFunction } from "express";
 import type { Db } from "../db/connection";
 import { ensureUserAndMember } from "../modules/me/bootstrap";
+import type { ProfileSummary } from "../intelligence/engine"; // adjust path if needed
+import { decryptProfile } from "../modules/profile/crypto"; // adjust path
+
 
 export type AppContext = {
   userId: string;
@@ -11,6 +14,11 @@ export type AppContext = {
   requestId: string; // 👈 add
   profileMode: "privacy" | "sync";
   syncEnabled: boolean;
+
+    // ✅ NEW (optional, only in sync mode)
+    preferences?: any | null;
+    profile?: any | null;
+    profileSummary?: ProfileSummary | null;
 };
 
 declare global {
@@ -23,6 +31,41 @@ declare global {
 
 function uniq(arr: string[]) {
   return Array.from(new Set(arr));
+}
+
+
+function safeDecrypt(encryptedJson: any) {
+  try {
+    if (!encryptedJson || typeof encryptedJson !== "string") return null;
+    return decryptProfile(encryptedJson);
+  } catch (e) {
+    console.warn("DECRYPT_FAILED", (e as any)?.message ?? e);
+    return null;
+  }
+}
+
+/**
+ * Minimal “engine-ready” ProfileSummary.
+ * This avoids relying on user_profile_secure shape.
+ */
+function buildProfileSummaryFromPrefs(prefs: any) {
+  const goal = prefs?.goal === "lose" || prefs?.goal === "gain" || prefs?.goal === "maintain"
+    ? prefs.goal
+    : "maintain";
+
+  const cuisines = Array.isArray(prefs?.cuisines) ? prefs.cuisines.filter(Boolean) : [];
+
+  const health = prefs?.health && typeof prefs.health === "object" ? prefs.health : {};
+  const diabetes = !!health.diabetes;
+  const highBP = !!health.highBP;
+  const fattyLiver = !!health.fattyLiver;
+
+  // Keep it super defensive and only populate what your engine uses.
+  return {
+    derived: { primaryGoal: goal },
+    preferences: { cuisines },
+    health: { diabetes, highBP, fattyLiver },
+  };
 }
 
 
@@ -166,6 +209,31 @@ const requestId =
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 
+  let preferences: any | null = null;
+let profile: any | null = null;
+let profileSummary: any | null = null;
+
+if (syncEnabled) {
+  // preferences
+  const prefRow = db
+    .prepare("SELECT encryptedJson FROM user_profile_preferences_secure WHERE userId=?")
+    .get(userId) as { encryptedJson?: string } | undefined;
+
+  preferences = safeDecrypt(prefRow?.encryptedJson);
+
+  // optional: full profile (if you need it elsewhere)
+  const profRow = db
+    .prepare("SELECT encryptedJson FROM user_profile_secure WHERE userId=?")
+    .get(userId) as { encryptedJson?: string } | undefined;
+
+  profile = safeDecrypt(profRow?.encryptedJson);
+
+  // build summary for engine/vector usage
+  profileSummary = preferences ? buildProfileSummaryFromPrefs(preferences) : null;
+}
+
+
+
 req.ctx = {
   userId,
   memberId,
@@ -175,6 +243,10 @@ req.ctx = {
   requestId,
   profileMode,
 syncEnabled,
+
+preferences,
+profile,
+profileSummary,
 };
 
 

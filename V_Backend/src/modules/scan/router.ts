@@ -5,9 +5,16 @@ const { createWorker, PSM } = Tesseract;
 import sharp from "sharp";
 import { requireSyncMode, apiOk, apiErr } from "../../middleware/resolveContext";
 import { getSyncPreferences } from "../restaurants/preferences";
+import { mergeIntoDailyConsumed } from "../../intelligence/daily-log";
+import { buildDailyVector2 } from "../../intelligence/engine";
+import { computeMacroGapFromVector } from "../../intelligence/macro-gap";
+import { loadTodayConsumed, saveTodayConsumed } from "../../intelligence/daily-log";
+
+
+
 
 // ✅ Canonical scorer
-import { openAiScoreOneItem, openAiScorePlateV2,openAiScoreFullPlate , openAiScorePlateVision, openAiVisionPreflight} from "../ai/openai-score";
+import { openAiScoreOneItem, openAiScorePlateV2, openAiScoreFullPlate, openAiScorePlateVision, openAiVisionPreflight } from "../ai/openai-score";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -228,46 +235,121 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
         userPreferences: prefs,
       });
 
+      const userId = req?.ctx?.userId ?? "unknown";
+      const profile = req?.ctx?.profile;
+
+      const today = await loadTodayConsumed(userId);
+      const updated = mergeIntoDailyConsumed(today, plate.totalMealNutrition);
+      await saveTodayConsumed(userId, updated);
+
+      const vector = buildDailyVector2({
+        profile,
+        consumed: updated,
+        behavior14d: null,
+        targetsOverride: null,
+      });
+
+      const macroGap = computeMacroGapFromVector(vector);
+
+
       return res.json(
         apiOk(req, {
           kind: "plate_v2",
           plate,
           overall: plate.overall,
           totalMealNutrition: plate.totalMealNutrition,
+          onsumedToday: updated,
+          macroGapSummary: macroGap.summary,
+          macroGapConfidence: macroGap.confidence,
           debug: { preflight: pre }, // optional, remove later
+          
+
         })
       );
     }
 
     // ✅ Single-item path (cheaper)
-    const out = await openAiScoreOneItem({
-      source: "scan",
-      mode: "vision",
-      imageBuffer: normalized,
-      mime: "image/jpeg",
-      detectedText: null,
-      cuisine: null,
-      mealType: null,
-      userPreferences: prefs,
+// ✅ Single-item path (cheaper)
+const out = await openAiScoreOneItem({
+  source: "scan",
+  mode: "vision",
+  imageBuffer: normalized,
+  mime: "image/jpeg",
+  detectedText: null,
+  cuisine: null,
+  mealType: null,
+  userPreferences: prefs,
+  
+  
+});
+
+const { itemName, scoringJson } = out as any;
+
+const userId = req?.ctx?.userId ?? "unknown";
+const profile = req?.ctx?.profileSummary ?? null; // ✅ FIX: use profileSummary
+
+const addition = {
+  calories: scoringJson?.estimates?.calories ?? null,
+  protein_g: scoringJson?.estimates?.protein_g ?? null,
+  carbs_g: scoringJson?.estimates?.carbs_g ?? null,
+  fat_g: scoringJson?.estimates?.fat_g ?? null,
+  fiber_g: scoringJson?.estimates?.fiber_g ?? null,
+  sugar_g: scoringJson?.estimates?.sugar_g ?? null,
+  sodium_mg: scoringJson?.estimates?.sodium_mg ?? null,
+};
+
+// defaults so response always works
+let consumedToday: any = null;
+let macroGapSummary: any = null;
+let macroGapConfidence: number | null = null;
+
+try {
+  const today = await loadTodayConsumed(userId);
+  const updated = mergeIntoDailyConsumed(today, addition);
+  await saveTodayConsumed(userId, updated);
+
+  consumedToday = updated;
+
+  // Only compute vector/macroGap if we actually have a profileSummary
+  if (profile) {
+    const vector = buildDailyVector2({
+      profile,
+      consumed: updated,
+      behavior14d: null,
+      targetsOverride: null,
     });
 
-    const { itemName, scoringJson } = out as any;
+    const macroGap = computeMacroGapFromVector(vector);
+    macroGapSummary = macroGap.summary;
+    macroGapConfidence = macroGap.confidence;
+  }
+} catch (err: any) {
+  // DO NOT fail the scan; just omit these fields
+  console.warn("DAILY_VECTOR_UPDATE_FAILED", err?.message ?? err);
+}
 
-    return res.json(
-      apiOk(req, {
-        kind: "item_v1",
-        itemName,
-        scoring: {
-          score: scoringJson.score,
-          label: scoringJson.label,
-          why: scoringJson.why,
-          reasons: scoringJson.reasons,
-          flags: scoringJson.flags,
-        },
-        scoringJson,
-        debug: { preflight: pre }, // optional, remove later
-      })
-    );
+return res.json(
+  apiOk(req, {
+    kind: "item_v1",
+    itemName,
+    scoring: {
+      score: scoringJson.score,
+      label: scoringJson.label,
+      why: scoringJson.why,
+      reasons: scoringJson.reasons,
+      flags: scoringJson.flags,
+    },
+    scoringJson,
+    consumedToday,         // may be null if daily log failed
+    macroGapSummary,       // may be null if profileSummary missing
+    macroGapConfidence,    // may be null
+    debug: { preflight: pre },
+  })
+);
+
+
+
+
   } catch (e) {
     const r = apiErr(req, "SYNC_VISION_SCORE_FAILED", "Could not score photo.", "Try again.", 500, true);
     return res.status(r.status).json({ ...r.body, debug: { message: (e as Error)?.message ?? "unknown" } });

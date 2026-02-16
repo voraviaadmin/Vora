@@ -4,12 +4,24 @@ import { AiScoringSchema, type AiScoring } from "../scoring";
 
 type ScoreSource = "menu" | "scan";
 
+type DayContext = {
+  goal?: "lose" | "maintain" | "gain" | string;
+  macroGapSummary?: {
+    proteinGap_g?: number;
+    fiberGap_g?: number;
+    caloriesRemaining?: number;
+    sugarRisk?: "low" | "medium" | "high";
+    sodiumRisk?: "low" | "medium" | "high";
+  };
+};
+
 type CommonArgs = {
   source: ScoreSource;
   cuisine?: string | null;
   mealType?: string | null;
   userPreferences?: unknown;
   model?: string; // optional override
+  dayContext?: DayContext | null;
 };
 
 export type AiVisionScoreResult = {
@@ -42,8 +54,6 @@ export async function openAiScoreOneItem(
     detectedText?: string | null;
   }
 ): Promise<AiVisionScoreResult>;
-
-
 
 export async function openAiScoreOneItem(
   args:
@@ -201,7 +211,9 @@ async function scoreTextOne(args: CommonArgs & { mode: "text"; itemName: string;
     cuisine: args.cuisine ?? null,
     mealType: args.mealType ?? null,
     userPreferences: args.userPreferences ?? null,
-  });
+    dayContext: args.dayContext ?? null,
+
+  })
 
   const json = await callOpenAIJson({ apiKey, model, prompt, maxOutputTokens: 900 });
 
@@ -223,6 +235,7 @@ async function scoreVisionOne(
     cuisine: args.cuisine ?? null,
     mealType: args.mealType ?? null,
     userPreferences: args.userPreferences ?? null,
+    dayContext: args.dayContext ?? null,
   });
 
   const json = await callOpenAIVisionJson({
@@ -283,6 +296,7 @@ async function scoreVisionPlateV2(
     cuisine: args.cuisine ?? null,
     mealType: args.mealType ?? null,
     userPreferences: args.userPreferences ?? null,
+    dayContext: args.dayContext ?? null,
   });
 
   const json = await callOpenAIVisionJson({
@@ -478,12 +492,16 @@ function buildTextPrompt(args: {
   cuisine: string | null;
   mealType: string | null;
   userPreferences: unknown;
+  dayContext: unknown;
 }): string {
   return `
 Score ONE ${args.source === "menu" ? "restaurant menu item" : "scanned food item"} for a user.
 
-User preferences JSON:
+USER PREFERENCES JSON:
 ${JSON.stringify(args.userPreferences ?? null)}
+
+DAY CONTEXT (today-aware):
+${JSON.stringify(args.dayContext ?? null)}
 
 Item:
 - name: ${args.itemName}
@@ -491,19 +509,27 @@ Item:
 - cuisine: ${args.cuisine ?? "unknown"}
 - mealType: ${args.mealType ?? "unknown"}
 
+Scoring rules:
+- Use goal + macroGapSummary to weight scoring:
+  - If proteinGap_g is high → reward protein-heavy options
+  - If sodiumRisk is high → penalize high sodium harder
+  - If sugarRisk is high → penalize added sugar harder
+  - If caloriesRemaining is low → penalize calorie-dense items harder
+
 Return STRICT JSON only with EXACT keys:
 {
   "score": number (0-100),
   "label": "Good" | "Ok" | "Not Preferred",
-  "why": string (1-2 sentences, plain English),
-  "reasons": string[] (2-3 short bullets),
-  "flags": string[] (0-8 items),
+  "why": string,
+  "reasons": string[],
+  "flags": string[],
   "nutritionNotes": string|null,
   "estimates": {
     "calories": number|null,
     "protein_g": number|null,
     "carbs_g": number|null,
     "fat_g": number|null,
+    "fiber_g": number|null,
     "sugar_g": number|null,
     "sodium_mg": number|null
   },
@@ -517,11 +543,12 @@ Return STRICT JSON only with EXACT keys:
 
 Rules:
 - Output JSON ONLY (no markdown, no extra text)
-- If ingredients unknown, keep estimates mostly null and avoid overconfident flags
-- Keep "why" short and user-friendly
-- reasons must be short
+- reasons must be 2-3 short bullets
+- flags max 8
 `.trim();
 }
+
+
 
 function buildVisionPrompt(args: {
   source: ScoreSource;
@@ -529,12 +556,16 @@ function buildVisionPrompt(args: {
   cuisine: string | null;
   mealType: string | null;
   userPreferences: unknown;
+  dayContext?: any | null;
 }): string {
   return `
 You will score ONE food item from an image for a user.
 
 User preferences JSON:
 ${JSON.stringify(args.userPreferences ?? null)}
+
+Day context (today-aware):
+${JSON.stringify(args.dayContext ?? null)}
 
 Context:
 - source: ${args.source}
@@ -562,6 +593,7 @@ Return JSON only in this exact format:
       "protein_g": number | null,
       "carbs_g": number | null,
       "fat_g": number | null,
+      "fiber_g": number | null,
       "sugar_g": number | null,
       "sodium_mg": number | null
     },
@@ -588,6 +620,7 @@ function buildPlateVisionPrompt(args: {
   cuisine: string | null;
   mealType: string | null;
   userPreferences: unknown;
+  dayContext?: any | null; // ✅ add this
 }): string {
   return `
 You are a certified clinical nutritionist and global food recognition expert.
@@ -596,6 +629,9 @@ Analyze the entire meal image and return FULL PLATE intelligence.
 
 User preferences JSON:
 ${JSON.stringify(args.userPreferences ?? null)}
+
+Day context (today-aware):
+${JSON.stringify(args.dayContext ?? null)}
 
 Context:
 - cuisine: ${args.cuisine ?? "unknown"}
