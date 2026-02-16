@@ -757,17 +757,33 @@ export async function openAiVisionPreflight(args: {
 
   const b64 = args.imageBuffer.toString("base64");
   const prompt = `
-Decide if the image shows a SINGLE main food item or a FULL PLATE with MULTIPLE items.
-
-Return JSON only:
-{ "kind":"single"|"plate"|"uncertain", "reason":"short", "itemHint":string|null }
-
-Rules:
-- "single" = one dominant item (burger, bowl, sandwich) with maybe garnish.
-- "plate" = multiple distinct items/sides (rice + curry + roti + salad).
-- If not sure, "uncertain".
-- itemHint only when kind="single" (2-4 words).
-`.trim();
+  You are classifying a food image for a nutrition scan pipeline.
+  
+  Goal: decide whether the image is:
+  - "single": ONE dominant food/drink item (minor accompaniments like sauce/dip/garnish are allowed)
+  - "plate": multiple dominant items OR multiple units OR dominant item + meaningful side
+  - "uncertain": only if image is too unclear to decide; when uncertain, prefer "plate" (conservative)
+  
+  Return JSON only:
+  { "kind":"single"|"plate"|"uncertain", "reason":"short", "itemHint":string|null }
+  
+  Decision rules (strict):
+  1) SINGLE:
+     - exactly one dominant item occupies primary focus
+     - allowed extras: small sauce/dip, garnish, small seasoning
+     - examples: burger (with sauce), veggie sandwich, nuggets (with/without sauce), single cup of tea/coffee
+  2) PLATE:
+     - 2+ dominant items (burger + fries/chips/shake; poori + curry; rice + curry + roti)
+     - multiple units of same item (2 apples, apple+banana, 2 brownies, 3 drumsticks)
+     - dominant item + meaningful quantity side (chips bowl, fries, dessert, second entrée)
+  3) If unsure, choose "plate" (or "uncertain" only if the image is genuinely unreadable).
+  
+  itemHint:
+  - Only include when kind="single"
+  - 2-4 words, generic food name, no extra adjectives
+  
+  Output JSON only (no markdown, no extra text).
+  `.trim();
 
   const json = await callOpenAIVisionJson({
     apiKey,

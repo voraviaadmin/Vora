@@ -351,6 +351,16 @@ export function buildDailyVector2(input: {
 
   const confidence = computeConfidence({ consumed, behavior, mode: input.profile.mode });
 
+
+  //console.log("Deficit:", deficit);
+  //console.log("Risk:", risk);
+  //console.log("Warning:", warning);
+  //console.log("Confidence:", confidence);
+
+
+
+
+
   return {
     targets,
     consumed,

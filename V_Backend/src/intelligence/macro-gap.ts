@@ -190,6 +190,13 @@ import {
     const sugarRisk = sugarPct >= 0.85 ? "high" : sugarPct >= 0.65 ? "medium" : "low";
     const sodiumRisk = sodiumPct >= 0.85 ? "high" : sodiumPct >= 0.65 ? "medium" : "low";
   
+
+    console.log("Consumed:", consumed);
+    console.log("Targets:", targets);
+    console.log("Sugar risk:", sugarRisk);
+    console.log("Sodium risk:", sodiumRisk);
+
+
     return {
       consumed,
       targets,

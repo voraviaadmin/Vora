@@ -218,6 +218,7 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
       imageBuffer: normalized,
       mime: "image/jpeg", // because we converted to jpeg
     });
+    console.log("Preflight result:", pre);
 
     const kind = pre?.kind ?? "uncertain";
 
@@ -234,7 +235,7 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
         mealType: null,
         userPreferences: prefs,
       });
-
+      
       const userId = req?.ctx?.userId ?? "unknown";
       const profile = req?.ctx?.profile;
 
@@ -242,14 +243,41 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
       const updated = mergeIntoDailyConsumed(today, plate.totalMealNutrition);
       await saveTodayConsumed(userId, updated);
 
-      const vector = buildDailyVector2({
-        profile,
-        consumed: updated,
-        behavior14d: null,
-        targetsOverride: null,
-      });
+      console.log("Plate result:", plate);
+      console.log("Plate totalMealNutrition:", plate.totalMealNutrition);
 
-      const macroGap = computeMacroGapFromVector(vector);
+
+      if (!plate || !plate.totalMealNutrition) {
+        console.error("Plate response missing totalMealNutrition:", plate);
+        const r = apiErr(req, "PLATE_SCHEMA_INVALID", "Scan returned invalid result.", "Try again.", 500, true);
+        return res.status(r.status).json(r.body);
+      }
+      
+      let macroGapSummary: any = null;
+      let macroGapConfidence: number | null = null;
+      
+      try {
+        // IMPORTANT: use profileSummary if that’s what buildDailyVector2 expects
+        const profileForVector = req?.ctx?.profileSummary ?? req?.ctx?.profile ?? null;
+      
+        if (profileForVector) {
+          const vector = buildDailyVector2({
+            profile: profileForVector,
+            consumed: updated,
+            behavior14d: null,
+            targetsOverride: null,
+          });
+      
+          const macroGap = computeMacroGapFromVector(vector);
+          macroGapSummary = macroGap?.summary ?? null;
+          macroGapConfidence = macroGap?.confidence ?? null;
+        } else {
+          console.warn("MACRO_GAP_SKIPPED: profile missing");
+        }
+      } catch (err: any) {
+        console.warn("MACRO_GAP_FAILED:", err?.message ?? err);
+        // DO NOT throw — scan must still succeed
+      }
 
 
       return res.json(
@@ -258,9 +286,9 @@ const syncScanVisionScoreHandler = async (req: any, res: any) => {
           plate,
           overall: plate.overall,
           totalMealNutrition: plate.totalMealNutrition,
-          onsumedToday: updated,
-          macroGapSummary: macroGap.summary,
-          macroGapConfidence: macroGap.confidence,
+          consumedToday: updated,
+          macroGapSummary,
+          macroGapConfidence,
           debug: { preflight: pre }, // optional, remove later
           
 

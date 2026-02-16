@@ -97,6 +97,7 @@ type ApiErrorDetails = {
 type ApiMeta = {
   feature?: string;     // e.g. "eatout.nearby_search"
   operation?: string;   // e.g. "places.nearby" | "openai.score" | "snapshot.upsert"
+  timeoutMs?: number;   // ✅ add this
 };
 
 
@@ -153,12 +154,29 @@ function hasHeader(h: Record<string, string>, key: string): boolean {
 }
 
 function isLikelyFormData(body: any): boolean {
+  if (!body) return false;
+
+  // RN FormData polyfill often fails `instanceof FormData`
+  const ctor = body?.constructor?.name;
+  const hasAppend = typeof body?.append === "function";
+
+  // RN commonly stores parts in `_parts`
+  const hasPartsArray = Array.isArray((body as any)?._parts);
+
+  // Some implementations expose getParts()
+  const hasGetParts = typeof (body as any)?.getParts === "function";
+
+  // Browser FormData (when it works)
+  let isNative = false;
   try {
-    return typeof FormData !== "undefined" && body instanceof FormData;
+    isNative = typeof FormData !== "undefined" && body instanceof FormData;
   } catch {
-    return false;
+    isNative = false;
   }
+
+  return Boolean(isNative || (hasAppend && (ctor === "FormData" || hasPartsArray || hasGetParts)));
 }
+
 
 function makeRequestId() {
   // lightweight, no dependency
@@ -233,37 +251,32 @@ export async function apiJson<T>(path: string, opts: RequestInit = {}, meta?: Ap
   const headers = mergeHeaders(opts.headers, opts, snap, path, meta);
 
   const controller = new AbortController();
-  const timeoutMs = 15000;
+
+  // ✅ Allow slower endpoints more time (uploads + vision)
+  // Keep default 15s for everything else.
+  const p = normalizePath(path);
+  const timeoutMs =
+    p.startsWith("/v1/sync/scan/score-vision") ? 60000 :
+    p.startsWith("/v1/sync/menu/score-vision") ? 60000 :
+    15000;
+  
   const t = setTimeout(() => controller.abort(), timeoutMs);
+  
+
 
   try {
-    if (__DEV__) {
-      console.log("[apiJson] request", {
-        path: normalizePath(path),
-        method,
-        mode: snap.mode,
-      });
-    }
-
-    const res = await fetch(url, {
-      ...opts,
-      headers,
-      credentials: "include",
-      signal: controller.signal,
-    });
-
-    if (__DEV__) {
-      console.log("[apiJson] response", {
-        path: normalizePath(path),
-        status: res.status,
-        ok: res.ok,
-      });
-    }
-
+    const res = await fetch(url, { ...opts, headers, credentials: "include", signal: controller.signal });
     return await handleJson<T>(res, url, normalizePath(path));
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error(`REQUEST_TIMEOUT: ${normalizePath(path)} exceeded ${timeoutMs}ms`);
+    }
+    throw e;
   } finally {
     clearTimeout(t);
   }
+
+
 }
 
 /** Back-compat helpers used throughout the app */
