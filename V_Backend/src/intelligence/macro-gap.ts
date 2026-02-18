@@ -103,6 +103,14 @@ import {
   }
   
   
+  export type ModularPrepPlan = {
+    dishName: string;
+    totalMinutes: number;
+    quantities: Array<{ ingredient: string; grams: number; notes?: string }>;
+    prepModules: Array<{ step: number; action: string; temperatureC?: number | null; timeMinutes?: number | null }>;
+    constraints: string[];
+  };
+  
 
 
   export type BestNextMealIntent = {
@@ -167,9 +175,17 @@ import {
       logAfterMealPrompt?: { prompt: string } | null;
     };
   
+  // ✅ ADD THIS
+  cookPlan?: ModularPrepPlan | null;
+
+
     meta: {
       confidence: number; // 0..1 overall
       expiresAt: string;
+
+    // ✅ ADD THIS
+    primaryRoute: "eatout" | "home";
+      
     };
   };
   
@@ -318,6 +334,7 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
   
   export function buildDeterministicDishOptions(input: {
     intent: BestNextMealIntent;
+    profile: ProfileSummary;
   }): DishOption[] {
     const { macroGap, cuisines, timeWindow } = input.intent.context;
     const cuisineHint = cuisines[0] ?? "healthy";
@@ -400,11 +417,28 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
       );
     }
   
-    // Enforce max 2 tags, max options
-    const max = input.intent.decisionPolicy.maxOptions;
-    return options
-      .map((o) => ({ ...o, tags: (o.tags ?? []).slice(0, 2) }))
-      .slice(0, max);
+// Enforce max 2 tags, max options
+const max = input.intent.decisionPolicy.maxOptions;
+
+// existing options: [opt_a, opt_b, ...] (currently eatout)
+const eatoutPrimary = options[0];
+const cookOpt = buildCookAnalogOption(eatoutPrimary, input.intent);
+
+// ✅ use the real profile (not intent.profile)
+const primaryRoute = decidePrimaryRoute({ intent: input.intent, profile: input.profile });
+
+// ✅ combine routes (always include cook + eatout, ordered by primaryRoute)
+const combined =
+  primaryRoute === "home"
+    ? [cookOpt, eatoutPrimary]
+    : [eatoutPrimary, cookOpt];
+
+// normalize tags + cap to max
+return combined
+  .filter(Boolean)
+  .map((o) => ({ ...o, tags: (o.tags ?? []).slice(0, 2) }))
+  .slice(0, max);
+
   }
   
   export function buildExecutionPlan(input: {
@@ -428,6 +462,16 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
       // weighted: intent confidence + primary option
       0.55 * input.intent.context.macroGap.confidence + 0.45 * (primary?.confidence ?? 0.4)
     );
+
+
+    const cookPlan =
+  primary?.executionHints?.channel === "home" || secondary?.executionHints?.channel === "home"
+    ? buildCookPlan(input.intent)
+    : null;
+
+const primaryRoute: "eatout" | "home" =
+  primary?.executionHints?.channel === "home" ? "home" : "eatout";
+
   
     return {
       planId,
@@ -444,9 +488,13 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
           : null,
         logAfterMealPrompt: { prompt: "Log this meal after you eat (10 seconds)." },
       },
+      // ✅ ADD THIS
+      cookPlan,
       meta: {
         confidence: overallConfidence,
         expiresAt: input.intent.expiresAt,
+        // ✅ ADD THIS
+        primaryRoute,
       },
     };
   }
@@ -481,7 +529,7 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
   
 
 
-    const options = buildDeterministicDishOptions({ intent });
+    const options = buildDeterministicDishOptions({ intent, profile: input.profile });
     const plan = buildExecutionPlan({ intent, options, now: input.now });
   
     return { intent, options, plan, vector };
@@ -609,5 +657,95 @@ const cuisines = cuisineHint ? [cuisineHint] : [];
     if (h < 14) return "lunch";
     if (h < 17) return "snack";
     return "dinner";
+  }
+  
+
+  function decidePrimaryRoute(input: {
+    intent: BestNextMealIntent;
+    profile: ProfileSummary;
+  }): "eatout" | "home" {
+    const { macroGap, timeWindow, behavior14d } = input.intent.context;
+  
+    const eatingStyle = input.profile?.derived?.eatingStyle ?? null;
+
+  
+    // Strong bias if user explicitly prefers a style
+    if (eatingStyle === "home-heavy") return "home";
+    if (eatingStyle === "eat-out-heavy") return "eatout";
+  
+    // Risk-control bias: when sodium/sugar are high, cooking gives control
+    const highControlNeeded =
+      macroGap.summary.sodiumRisk === "high" || macroGap.summary.sugarRisk === "high";
+  
+    // If late-eating trend is high at dinner, cooking tends to be safer + faster decision
+    const lateTrendHigh = (behavior14d?.lateEatingPct ?? 0) >= 0.6;
+  
+    // If confidence is low, prefer eatout (searchKey is simpler) UNLESS control needed
+    const lowConfidence = macroGap.confidence < 0.45;
+  
+    if (highControlNeeded) return "home";
+    if (timeWindow === "dinner" && lateTrendHigh) return "home";
+    if (lowConfidence) return "eatout";
+  
+    // Default: balanced → eatout slightly preferred for Phase 1 speed
+    return "eatout";
+  }
+  
+
+  function buildCookAnalogOption(primaryEatout: DishOption, intent: BestNextMealIntent): DishOption {
+    const cuisineHint = intent.context.cuisines?.[0] ?? "Balanced";
+    const title = `${cuisineHint} lean bowl (cook)`;
+  
+    return {
+      id: "opt_home",
+      title,
+      why: "Same goal, more control. 10–15 minutes.",
+      tags: ["Cook", ...(primaryEatout.tags ?? []).filter(t => t !== "Best")].slice(0, 2),
+      confidence: clamp01((primaryEatout.confidence ?? 0.5) + 0.05),
+      executionHints: {
+        channel: "home",
+        // Keep aligned with eatout searchKey so UI can reuse intent naming if needed
+        searchKey: primaryEatout.executionHints?.searchKey ?? title,
+        constraints: primaryEatout.executionHints?.constraints ?? [],
+      },
+      handoff: { qrPayload: null, restaurantFilter: null },
+    };
+  }
+  
+  function buildCookPlan(intent: BestNextMealIntent): ModularPrepPlan {
+    const { macroGap, cuisines } = intent.context;
+    const cuisine = cuisines?.[0] ?? "Balanced";
+  
+    const proteinGap = macroGap.summary.proteinGap_g;
+    const proteinTarget_g = Math.max(35, Math.min(60, Math.round(proteinGap > 0 ? proteinGap : 45)));
+  
+    // Simple grams heuristic: ~23g protein per 100g cooked chicken breast (rough)
+    const chicken_g = Math.max(160, Math.min(240, Math.round((proteinTarget_g / 23) * 100)));
+  
+    const constraints: string[] = [];
+    if (macroGap.summary.sodiumRisk !== "low") constraints.push("low-sodium");
+    if (macroGap.summary.sugarRisk !== "low") constraints.push("low-sugar");
+    if (proteinGap >= 20) constraints.push("high-protein");
+    if (macroGap.summary.fiberGap_g >= 6) constraints.push("high-fiber");
+  
+    return {
+      dishName: `${cuisine} lean protein bowl`,
+      totalMinutes: 12,
+      quantities: [
+        { ingredient: "Chicken breast", grams: chicken_g, notes: "Lean protein" },
+        { ingredient: "Mixed vegetables", grams: 150, notes: "Fiber + volume" },
+        { ingredient: "Cooked rice or quinoa", grams: 120, notes: "Optional; reduce if low-carb" },
+        { ingredient: "Olive oil", grams: 5 },
+        { ingredient: "Lemon / herbs", grams: 10, notes: "Flavor without sodium" },
+      ],
+      prepModules: [
+        { step: 1, action: "Preheat pan", temperatureC: 190, timeMinutes: 2 },
+        { step: 2, action: "Add olive oil", temperatureC: null, timeMinutes: null },
+        { step: 3, action: "Cook chicken 5 min per side (internal 74°C)", temperatureC: 190, timeMinutes: 10 },
+        { step: 4, action: "Sauté vegetables 3–4 min", temperatureC: 180, timeMinutes: 4 },
+        { step: 5, action: "Assemble bowl + finish with lemon/herbs", temperatureC: null, timeMinutes: null },
+      ],
+      constraints,
+    };
   }
   

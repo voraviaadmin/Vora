@@ -1,5 +1,13 @@
-import { useEffect, useMemo, useState} from "react";
-import React from "react";
+// app/(tabs)/index.tsx
+// DROP-IN REPLACEMENT — Home (Option 4C)
+// Goals:
+// - Ring stays, but smaller + quieter (no status/description/reset noise)
+// - Today Focus becomes a single action-first strip (Alignment + Watchout + Budget + Window)
+// - “Best Next Meal” remains the ONE decision block (primary emphasized)
+// - Cook option opens a modal with dynamic steps (from executionPlan.cookPlan if present)
+// - Insights explains “why” with “So far: X/Y …” (zero-patience default)
+
+import React, { useEffect, useMemo, useState } from "react";
 import {
   ScrollView,
   StyleSheet,
@@ -7,7 +15,7 @@ import {
   View,
   Pressable,
   Modal,
-  ActivityIndicator,
+  Platform,
 } from "react-native";
 import { useFocusEffect, router } from "expo-router";
 
@@ -15,6 +23,7 @@ import { UI } from "../../src/theme/ui";
 import { useMe } from "../../src/hooks/useMe";
 import { useHomeSummary } from "../../src/hooks/use-home-summary";
 import type { HomeWindow, HomeSummaryResponse } from "../../src/api/home";
+import type { MeResponse } from "../../src/api/me";
 
 import { Card } from "../../components/ui/card";
 import { Button } from "../../components/ui/button";
@@ -25,10 +34,6 @@ import { Ring } from "../../components/ui/Ring";
 // DEV ONLY
 import { DevStatusCard } from "../../components/dev/DevStatusCard";
 import { useModeGate } from "../../src/hooks/use-mode-gate";
-import type { MeResponse } from "../../src/api/me";
-
-// once-per-session flag (module scope)
-let homeRingAnimatedOnce = false;
 
 const WINDOW_ORDER: HomeWindow[] = ["daily", "3d", "7d", "14d"];
 function nextWindow(w: HomeWindow): HomeWindow {
@@ -36,8 +41,12 @@ function nextWindow(w: HomeWindow): HomeWindow {
   return WINDOW_ORDER[(idx + 1) % WINDOW_ORDER.length];
 }
 
+// once-per-session flag (module scope)
+let homeRingAnimatedOnce = false;
+
 type ConfidenceTier = "high" | "medium" | "low";
 type Tone = "straight" | "encouraging" | "coach";
+type RiskLevel = "low" | "medium" | "high";
 
 function tierFromConfidence(conf: number | null | undefined): ConfidenceTier {
   const c = typeof conf === "number" ? conf : 0;
@@ -59,22 +68,17 @@ function copy(tone: Tone) {
   const base = {
     confidenceHint: {
       high: "Strong pick",
-      medium: "Two good options",
+      medium: "Two good paths",
       low: "Let’s narrow it down",
-    },
-    empty: {
-      title: "Best Next Meal",
-      subtitle: "Start simple — I’ll adapt as you log.",
     },
     focus: {
       title: "Today Focus",
-      subtitle: "Quick signal — not a lecture.",
+      subtitle: "At a glance",
     },
     best: {
       title: "Best Next Meal",
       ctaEatout: "Find nearby",
       ctaCook: "How to cook",
-      cookNote: "Step-by-step plan",
     },
     insight: {
       title: "Insights",
@@ -83,27 +87,24 @@ function copy(tone: Tone) {
     },
     micro: {
       updated: (min: number) => (min <= 1 ? "Updated just now" : `Updated ${min} min ago`),
-      tapRing: "Tap ring to switch window",
     },
     recovery: {
-      lowScore: "Keep it simple today — one good choice is enough.",
+      lowScore: "Keep it simple — one strong choice is enough.",
     },
   };
 
   if (tone === "encouraging") {
     return {
       ...base,
-      recovery: { lowScore: "All good — keep it simple today. One solid choice helps." },
-      empty: { ...base.empty, subtitle: "No pressure — start with one choice and I’ll adapt." },
-      confidenceHint: { high: "Feeling confident", medium: "A couple good paths", low: "Let’s explore" },
+      recovery: { lowScore: "All good — one solid choice helps today." },
+      confidenceHint: { high: "Feeling confident", medium: "Two good options", low: "Let’s explore" },
     };
   }
 
   if (tone === "coach") {
     return {
       ...base,
-      recovery: { lowScore: "Keep it clean today — one strong choice." },
-      empty: { ...base.empty, subtitle: "Choose one direction and execute." },
+      recovery: { lowScore: "Execute one clean choice." },
       confidenceHint: { high: "High confidence", medium: "Medium confidence", low: "Low confidence" },
     };
   }
@@ -119,11 +120,8 @@ function goEatOut(searchKey?: string) {
 }
 
 function getUserCuisines(me: MeResponse | null | undefined): string[] {
-  const cuisines =
-    me?.preferences?.cuisines ??
-    me?.profile?.preferences?.cuisines ??
-    [];
-  return Array.isArray(cuisines) ? cuisines.filter(Boolean) : [];
+  const cuisines = me?.preferences?.cuisines ?? me?.profile?.preferences?.cuisines ?? [];
+  return Array.isArray(cuisines) ? cuisines.filter(Boolean).map(String) : [];
 }
 
 function minutesSince(iso?: string | null): number | null {
@@ -135,10 +133,6 @@ function minutesSince(iso?: string | null): number | null {
   return Math.floor(diffMs / 60000);
 }
 
-/**
- * Phase 1: support bestNextMeal if backend provides it,
- * else derive minimal options from legacy `suggestion`.
- */
 type DishOptionView = {
   kind: "eatout" | "home";
   title: string;
@@ -152,11 +146,10 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
   insights?: string[];
 } {
   const anyHome = home as any;
-
-  // ✅ NEW preferred path: backend provides executionPlan under suggestion
   const s = anyHome?.suggestion ?? null;
   const plan = s?.executionPlan ?? null;
 
+  // Preferred path: macro-gap executionPlan with primaryOption / secondaryOption
   if (plan?.primaryOption) {
     const conf = plan?.meta?.confidence;
     const tier = tierFromConfidence(typeof conf === "number" ? conf : (s as any)?.confidence);
@@ -167,7 +160,6 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
     const toView = (opt: any): DishOptionView => ({
       kind: opt?.executionHints?.channel === "home" ? "home" : "eatout",
       title: String(opt?.title ?? "Option"),
-      // plan uses one-liner "why" (string). UI expects string[].
       why: opt?.why ? [String(opt.why)].slice(0, 2) : [],
       searchKey: opt?.executionHints?.searchKey ?? null,
     });
@@ -175,19 +167,17 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
     const options: DishOptionView[] = [toView(primary)];
     if (secondary) options.push(toView(secondary));
 
-    // Insights: show 1–2 microSteps when expanded (you already have collapse UI)
     const insights = Array.isArray(plan?.microSteps)
       ? plan.microSteps.slice(0, 2).map(String)
       : s?.contextNote
-      ? [String(s.contextNote)]
-      : undefined;
+        ? [String(s.contextNote)]
+        : undefined;
 
-    return { tier, options: options.slice(0, tier === "medium" ? 3 : 2), insights };
+    return { tier, options: options.slice(0, 2), insights };
   }
 
-  // ---- Legacy fallback: suggestion-based (your current behavior)
+  // Legacy fallback
   const tier = tierFromConfidence((s as any)?.confidence);
-
   const key =
     (s as any)?.route?.searchKey ??
     (Array.isArray((s as any)?.dishIdeas) && (s as any)?.dishIdeas?.[0]?.query) ??
@@ -198,15 +188,87 @@ function deriveOptionsFromHome(home: HomeSummaryResponse | null): {
     { kind: "home", title: "Simple home plate", why: [] },
   ];
 
-  if (tier === "medium") {
-    options.push({ kind: "eatout", title: "Second nearby option", why: [], searchKey: key });
-  }
-
   const insights = (s as any)?.contextNote ? [String((s as any).contextNote)] : undefined;
-
-  return { tier, options: options.slice(0, tier === "medium" ? 3 : 2), insights };
+  return { tier, options: options.slice(0, 2), insights };
 }
 
+function cap(v: unknown, n: number) {
+  const s = String(v ?? "").trim();
+  if (!s) return "";
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function pickTopWatchout(mgSummary: any): { label: string; valueText: string } | null {
+  const sugar: RiskLevel | null =
+    mgSummary?.sugarRisk === "high" || mgSummary?.sugarRisk === "medium" || mgSummary?.sugarRisk === "low"
+      ? mgSummary.sugarRisk
+      : null;
+  const sodium: RiskLevel | null =
+    mgSummary?.sodiumRisk === "high" || mgSummary?.sodiumRisk === "medium" || mgSummary?.sodiumRisk === "low"
+      ? mgSummary.sodiumRisk
+      : null;
+
+  const sev = (r: RiskLevel | null) => (r === "high" ? 3 : r === "medium" ? 2 : r === "low" ? 1 : 0);
+  const sugarSev = sev(sugar);
+  const sodiumSev = sev(sodium);
+
+  if (sugarSev === 0 && sodiumSev === 0) return null;
+
+  if (sugarSev >= sodiumSev) {
+    return {label: "Sugar", valueText: `${String(sugar).toUpperCase()}` };
+  }
+  return { label: "Sodium", valueText: `${String(sodium).toUpperCase()}` };
+}
+
+function titleCase(s: string) {
+  const t = String(s ?? "");
+  if (!t) return "";
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function buildFocusStrip(home: HomeSummaryResponse | null): { strip: string; hasAny: boolean } {
+  const anyHome = home as any;
+  const mgSummary = anyHome?.suggestion?.intent?.context?.macroGap?.summary ?? null;
+  const tw = anyHome?.suggestion?.intent?.context?.timeWindow ?? null;
+
+  const parts: string[] = [];
+
+  // Alignment (Protein then Fiber)
+  const pg = typeof mgSummary?.proteinGap_g === "number" ? mgSummary.proteinGap_g : null;
+  const fg = typeof mgSummary?.fiberGap_g === "number" ? mgSummary.fiberGap_g : null;
+
+  if (pg != null && pg >= 10) parts.push(`Protein +${Math.round(pg)}g`);
+  else if (fg != null && fg >= 4) parts.push(`Fiber +${Math.round(fg)}g`);
+
+  // Watchout (top only)
+  const top = pickTopWatchout(mgSummary);
+  if (top) parts.push(`${top.label}: ${top.valueText}`);
+
+  // Budget
+  const calLeft = typeof mgSummary?.caloriesRemaining === "number" ? mgSummary.caloriesRemaining : null;
+  if (calLeft != null && Number.isFinite(calLeft)) parts.push(`Cal left: ${Math.round(calLeft)}`);
+
+  // Window
+  if (tw) parts.push(`${titleCase(String(tw))}`);
+
+  const strip = parts.join("  |  ");
+  return { strip, hasAny: parts.length > 0 };
+}
+
+function buildSoFarLine(home: HomeSummaryResponse | null): string | null {
+  const anyHome = home as any;
+  const mg = anyHome?.suggestion?.intent?.context?.macroGap ?? null;
+  const consumed = mg?.consumed ?? null;
+  const targets = mg?.targets ?? null;
+  if (!consumed || !targets) return null;
+
+  const p = `${Math.round(consumed.protein_g ?? 0)}/${Math.round(targets.protein_g ?? 0)}g`;
+  const s = `${Math.round(consumed.sugar_g ?? 0)}/${Math.round(targets.sugar_g_max ?? 0)}g`;
+  const na = `${Math.round(consumed.sodium_mg ?? 0)}/${Math.round(targets.sodium_mg_max ?? 0)}mg`;
+  const cal = `${Math.round(consumed.calories ?? 0)}/${Math.round(targets.calories ?? 0)}`;
+
+  return `So far: Protein ${p}, Sugar ${s}, Sodium ${na}, Calories ${cal}`;
+}
 
 export default function HomeScreen() {
   const { mode } = useModeGate();
@@ -216,7 +278,6 @@ export default function HomeScreen() {
   const backendOk = !!me && !meIsError;
 
   const [window, setWindow] = useState<HomeWindow>("daily");
-
   const { data: home, refetch } = useHomeSummary(window, 5);
 
   useFocusEffect(
@@ -240,86 +301,104 @@ export default function HomeScreen() {
   const C = useMemo(() => copy(tone), [tone]);
 
   const hero = home?.heroScore;
-  const focus = home?.todaysFocus;
-
-  const recentCount = home?.recentLogs?.items?.length ?? 0;
-  const hasLogs = recentCount > 0;
-
-  const scoreValue = hero?.value ?? 0;
-  const isLowScoreDay = hasLogs && scoreValue > 0 && scoreValue < 55;
-
   const modeLabel = home?.header?.modeLabel ?? "Today";
 
   const updatedMin = useMemo(() => minutesSince(home?.meta?.generatedAt), [home?.meta?.generatedAt]);
+
+  const recentCount = home?.recentLogs?.items?.length ?? 0;
+  const hasLogs = recentCount > 0;
+  const scoreValue = hero?.value ?? 0;
+  const isLowScoreDay = hasLogs && scoreValue > 0 && scoreValue < 55;
 
   const derived = useMemo(() => deriveOptionsFromHome(home), [home]);
   const confidenceTier = derived.tier;
 
   // Low confidence cuisine chips (inline, only when low)
-  const cuisineChips = useMemo(() => {
-    const uniq = Array.from(new Set(getUserCuisines(me))).slice(0, 6);
-    return uniq;
-  }, [me]);
-
+  const cuisineChips = useMemo(() => Array.from(new Set(getUserCuisines(me))).slice(0, 6), [me]);
   const [selectedCuisine, setSelectedCuisine] = useState<string | null>(null);
   useEffect(() => {
-    // reset when confidence tier changes
     setSelectedCuisine(null);
   }, [confidenceTier]);
 
-  // Collapsed insight block (always collapsed by default)
+  // Focus strip
+  const focusStrip = useMemo(() => buildFocusStrip(home), [home]);
+
+  // Insights (collapsed by default)
   const [insightOpen, setInsightOpen] = useState(false);
+  const soFarLine = useMemo(() => buildSoFarLine(home), [home]);
 
   const insightsText = useMemo(() => {
     const lines: string[] = [];
+    if (soFarLine) lines.push(soFarLine);
 
-    // Prefer bestNextMeal insights if present
+    // Prefer plan microSteps / derived insights
     if (derived.insights?.length) lines.push(...derived.insights);
 
-    // Else: lightweight fallback from focus chips
-    if (!lines.length && focus?.chips?.length) {
-      const chips = focus.chips.slice(0, 2);
-      const a = chips[0] ? `${chips[0].label}: ${chips[0].valueText}` : "";
-      const b = chips[1] ? `${chips[1].label}: ${chips[1].valueText}` : "";
-      const joined = [a, b].filter(Boolean).join(" • ");
-      if (joined) lines.push(joined);
-    }
+    // Add pick line if we have it (keeps it CEO-level explicit)
+    const pick = derived.options?.[0]?.title ? `Pick: "${derived.options[0].title}".` : "";
+    if (pick) lines.push(pick);
 
-    return lines.slice(0, 2);
-  }, [derived.insights, focus?.chips]);
+    return lines.filter(Boolean).slice(0, 2);
+  }, [soFarLine, derived.insights, derived.options]);
 
-  // Bottom sheet for “How to cook” (Phase 1 placeholder; later wire on-demand endpoint)
+  // Cook modal
   const [cookOpen, setCookOpen] = useState(false);
-  const [cookLoading] = useState(false);
-
   const plan = (home as any)?.suggestion?.executionPlan ?? null;
 
+  const cookSteps = useMemo((): string[] => {
+    const prepModules = plan?.cookPlan?.prepModules;
+    if (Array.isArray(prepModules) && prepModules.length) {
+      return prepModules.slice(0, 10).map((m: any) => {
+        const temp = typeof m.temperatureC === "number" ? ` @ ${m.temperatureC}°C` : "";
+        const time = typeof m.timeMinutes === "number" ? ` • ${m.timeMinutes} min` : "";
+        const step = typeof m.step === "number" ? m.step : null;
+        const prefix = step != null ? `${step}. ` : "";
+        return `${prefix}${String(m.action ?? "Step")}${temp}${time}`.trim();
+      });
+    }
+
+    if (Array.isArray(plan?.microSteps) && plan.microSteps.length) {
+      return plan.microSteps.slice(0, 10).map((s: unknown, i: number) => `${i + 1}. ${String(s)}`);
+    }
+
+    return ["1. Choose lean protein + vegetable base", "2. Keep sauces minimal", "3. Assemble and log after"];
+  }, [plan]);
+
+  const cookMeta = useMemo(() => {
+    const cp = plan?.cookPlan ?? null;
+    const mins = typeof cp?.totalMinutes === "number" ? cp.totalMinutes : 12;
+    const ingCount = Array.isArray(cp?.quantities) ? cp.quantities.length : 6;
+    return `${mins} min • ≤ ${Math.min(ingCount, 6)} ingredients`;
+  }, [plan]);
+
+  const cookIngredients = useMemo(() => {
+    const qs = plan?.cookPlan?.quantities;
+    if (!Array.isArray(qs) || !qs.length) return [];
+    return qs.slice(0, 6).map((q: any) => {
+      const g = typeof q.grams === "number" ? `${Math.round(q.grams)}g` : "";
+      const name = String(q.ingredient ?? "").trim();
+      const notes = q?.notes ? ` — ${String(q.notes)}` : "";
+      return `${name}${g ? ` • ${g}` : ""}${notes}`;
+    });
+  }, [plan]);
+
+  // Option press handler
   const onPressOption = (opt: DishOptionView) => {
     if (opt.kind === "eatout") {
-      const key = selectedCuisine ? selectedCuisine : (opt.searchKey ?? undefined);
+      const key = selectedCuisine ? selectedCuisine : opt.searchKey ?? undefined;
       goEatOut(key ?? undefined);
       return;
     }
-  
-    // home
-    // Optional: only open if plan has howToCook action (future)
-    if (plan?.actions?.howToCook) {
-      setCookOpen(true);
-    } else {
-      setCookOpen(true); // keep current behavior for now
-    }
+    setCookOpen(true);
   };
-  
 
-  // Today Focus pills: max 3
-  const focusChips = useMemo(() => {
-    const chips = focus?.chips ?? [];
-    return chips.slice(0, 3);
-  }, [focus?.chips]);
+  // Ring sizing (shrink 25–30%)
+  const ringSize = Math.round((UI.sizes?.ringSize ?? 240) * 0.72);
+  const ringStroke = Math.max(10, Math.round((UI.sizes?.ringStroke ?? 18) * 0.78));
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.container}>
-      {/* Header */}
+      {/* Header (clean, premium) */}
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <Text style={styles.appTitle}>Voravia</Text>
@@ -328,11 +407,13 @@ export default function HomeScreen() {
 
         <View style={styles.headerMetaRow}>
           <Text style={styles.headerMeta}>{modeLabel}</Text>
-          <Text style={styles.streakPill}>🔥 {home?.header?.streakDays ?? 0} day streak</Text>
+          <Text style={styles.headerMetaRight}>
+            🔥 {home?.header?.streakDays ?? 0} day streak
+          </Text>
         </View>
       </View>
 
-      {/* Score Ring */}
+      {/* Score (compact, quiet) */}
       <Card style={styles.heroCard}>
         <Pressable
           onPress={() => setWindow((w) => nextWindow(w))}
@@ -341,48 +422,53 @@ export default function HomeScreen() {
           style={styles.heroPressable}
         >
           <View style={styles.heroInner}>
-            <Ring
-              value={hero?.value ?? 0}
-              label={hero?.label ?? "Daily Score"}
-              statusWord={hero?.statusWord ?? "Start"}
-              description={hero?.description ?? "Log a meal to build your score."}
-              animate={animateRing}
-              durationMs={UI.motion?.ringMs ?? 600}
-            />
-            <View style={styles.ringMetaRow}>
-              <Text style={styles.resetsText}>{hero?.resetsText ?? C.micro.tapRing}</Text>
+            <View style={styles.heroTopRow}>
+              <Text style={styles.heroLabel}>{hero?.label ?? "Daily Score"}</Text>
               {typeof updatedMin === "number" ? (
-                <Text style={styles.updatedText}>{C.micro.updated(updatedMin)}</Text>
-              ) : null}
+                <Text style={styles.heroUpdated}>{C.micro.updated(updatedMin)}</Text>
+              ) : (
+                <Text style={styles.heroUpdated} />
+              )}
             </View>
+
+            <View style={styles.ringWrap}>
+              <Ring
+                value={hero?.value ?? 0}
+                label={null} // keep the ring clean; label is in heroTopRow
+                statusWord={null}
+                description={null}
+                animate={animateRing}
+                durationMs={UI.motion?.ringMs ?? 600}
+                size={ringSize}
+                stroke={ringStroke}
+              />
+            </View>
+
+            <Text style={styles.heroStatus}>{hero?.statusWord ?? "Start"}</Text>
           </View>
         </Pressable>
       </Card>
 
-      {/* Today Focus (informational only) */}
+      {/* Today Focus — single strip (action-first) */}
       <Card style={styles.focusCard}>
         <View style={styles.focusHeader}>
           <Text style={styles.focusTitle}>{C.focus.title}</Text>
           <Text style={styles.focusSubtitle}>{C.focus.subtitle}</Text>
         </View>
 
-        {focusChips.length ? (
-          <View style={styles.focusChipsWrap}>
-            {focusChips.map((ch) => (
-              <View key={ch.key} style={styles.focusPill}>
-                <Text style={styles.focusPillLabel}>{ch.label}</Text>
-                <Text style={styles.focusPillValue}>{ch.valueText}</Text>
-              </View>
-            ))}
-          </View>
-        ) : (
-          <Text style={styles.mutedText}>
-            {hasLogs ? "Your focus will appear as you log." : "Log once and I’ll shape your focus."}
+        <Pressable
+          onPress={() => setInsightOpen(true)}
+          style={styles.focusStripPill}
+          accessibilityRole="button"
+          accessibilityLabel="Open details"
+        >
+          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.focusStripText}>
+            {focusStrip.hasAny ? cap(focusStrip.strip, 140) : "Log once and I’ll shape today’s focus."}
           </Text>
-        )}
+        </Pressable>
       </Card>
 
-      {/* Best Next Meal (ONLY decision block) */}
+      {/* Best Next Meal — the ONE decision block */}
       <Card style={styles.bestCard}>
         <View style={styles.bestHeader}>
           <Text style={styles.bestTitle}>{C.best.title}</Text>
@@ -393,7 +479,7 @@ export default function HomeScreen() {
 
         {isLowScoreDay ? <Text style={styles.recoveryText}>{C.recovery.lowScore}</Text> : null}
 
-        {/* Low confidence: inline cuisine chips (optional) */}
+        {/* Low confidence: cuisine chips */}
         {confidenceTier === "low" && cuisineChips.length ? (
           <View style={styles.inlineChipsWrap}>
             {cuisineChips.map((c) => {
@@ -413,26 +499,21 @@ export default function HomeScreen() {
         <View style={styles.optionList}>
           {derived.options.map((opt, idx) => {
             const isPrimary = idx === 0;
-            const title = opt.title;
-
-            // Keep the UX clean: 2 why bullets max
-            const why = Array.isArray(opt.why) ? opt.why.slice(0, 2) : [];
+            const why = Array.isArray(opt.why) ? opt.why.slice(0, 1) : []; // 1 line max (CEO clean)
 
             return (
-              <View key={`${opt.kind}-${idx}`} style={styles.optionCard}>
+              <View key={`${opt.kind}-${idx}`} style={[styles.optionCard, isPrimary ? styles.optionCardPrimary : null]}>
                 <View style={styles.optionTopRow}>
-                  <Text style={styles.optionTitle}>{title}</Text>
+                  <Text style={[styles.optionTitle, isPrimary ? styles.optionTitlePrimary : null]}>
+                    {opt.title}
+                  </Text>
                   <Text style={styles.optionKind}>{opt.kind === "eatout" ? "Eat out" : "Home"}</Text>
                 </View>
 
                 {why.length ? (
-                  <View style={styles.whyList}>
-                    {why.map((w, i) => (
-                      <Text key={`${idx}-why-${i}`} style={styles.whyText}>
-                        • {w}
-                      </Text>
-                    ))}
-                  </View>
+                  <Text style={styles.whyText} numberOfLines={2}>
+                    • {why[0]}
+                  </Text>
                 ) : null}
 
                 <View style={styles.optionCtaRow}>
@@ -456,7 +537,7 @@ export default function HomeScreen() {
         </View>
       </Card>
 
-      {/* Insights (collapsed by default, max 2 lines when open) */}
+      {/* Insights (collapsed by default) */}
       {hasLogs && insightsText.length ? (
         <Card style={styles.insightCard}>
           <Pressable onPress={() => setInsightOpen((v) => !v)} style={styles.insightHeader}>
@@ -466,7 +547,7 @@ export default function HomeScreen() {
 
           {insightOpen ? (
             <View style={{ marginTop: UI.spacing.gapSm }}>
-              {insightsText.slice(0, 2).map((t, i) => (
+              {insightsText.map((t, i) => (
                 <Text key={`ins-${i}`} style={styles.insightText}>
                   {t}
                 </Text>
@@ -476,40 +557,65 @@ export default function HomeScreen() {
         </Card>
       ) : null}
 
-      {/* Bottom sheet: How to cook (Phase 1 placeholder) */}
-      <Modal visible={cookOpen} transparent animationType="slide" onRequestClose={() => setCookOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setCookOpen(false)} />
+      {/* Cook Plan Sheet */}
+      <Modal
+        visible={cookOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setCookOpen(false)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setCookOpen(false)}>
+          <View />
+        </Pressable>
+
         <View style={styles.sheet}>
           <View style={styles.sheetHeader}>
-            <Text style={styles.sheetTitle}>{C.best.ctaCook}</Text>
+            <Text style={styles.sheetTitle}>Cook Plan</Text>
             <Pressable onPress={() => setCookOpen(false)} style={styles.sheetClose}>
               <Text style={styles.sheetCloseText}>Close</Text>
             </Pressable>
           </View>
 
-          {cookLoading ? (
-            <View style={styles.sheetBody}>
-              <ActivityIndicator />
-              <Text style={styles.mutedText}>Building your plan…</Text>
-            </View>
-          ) : (
-            <View style={styles.sheetBody}>
-              <Text style={styles.sheetSubtitle}>{C.best.cookNote}</Text>
-              <Text style={styles.sheetText}>
-                Phase 1: this sheet is wired and ready. Next step is connecting the on-demand ExecutionPlan endpoint
-                so this returns ingredients + steps personalized to your profile and last 14 days.
-              </Text>
+          <Text style={styles.sheetSubtitle}>{cookMeta}</Text>
 
-              <View style={{ marginTop: UI.spacing.sectionGap }}>
-                <Button title="OK" onPress={() => setCookOpen(false)} />
-              </View>
+          {!!cookIngredients.length ? (
+            <View style={{ marginTop: 10, gap: 6 }}>
+              {cookIngredients.map((x, i) => (
+                <Text key={`ing-${i}`} style={styles.sheetLine}>
+                  • {x}
+                </Text>
+              ))}
             </View>
-          )}
+          ) : null}
+
+          <View style={styles.sheetBody}>
+            {cookSteps.slice(0, 10).map((s, idx) => (
+              <Text key={idx} style={styles.sheetLine}>
+                {s}
+              </Text>
+            ))}
+          </View>
+
+          <View style={styles.sheetActionsRow}>
+            <Pressable onPress={() => setCookOpen(false)} style={styles.sheetBtnGhost}>
+              <Text style={styles.sheetBtnGhostText}>Close</Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => {
+                // Later: confirm + log
+                setCookOpen(false);
+              }}
+              style={styles.sheetBtnPrimary}
+            >
+              <Text style={styles.sheetBtnPrimaryText}>Confirm</Text>
+            </Pressable>
+          </View>
         </View>
       </Modal>
 
       {/* DEV ONLY */}
-      {__DEV__ ? (
+     {/* {__DEV__ ? (
         <DevStatusCard
           backendOk={isPrivacy ? true : backendOk}
           backendLabel={isPrivacy ? "Disabled (Privacy Mode)" : undefined}
@@ -518,14 +624,14 @@ export default function HomeScreen() {
             isPrivacy
               ? null
               : meLoading
-              ? "Connecting to backend…"
-              : backendOk
-              ? null
-              : "Couldn’t reach backend."
+                ? "Connecting to backend…"
+                : backendOk
+                  ? null
+                  : "Couldn’t reach backend."
           }
           meJson={me ? JSON.stringify(me, null, 2) : null}
         />
-      ) : null}
+      ) : null}*/}
     </ScrollView>
   );
 }
@@ -550,16 +656,41 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   headerMeta: { fontSize: UI.type.caption, color: UI.colors.textMuted },
-  streakPill: { fontSize: UI.type.caption, fontWeight: "500", color: UI.colors.textMuted },
+  headerMetaRight: { fontSize: UI.type.caption, fontWeight: "500", color: UI.colors.textMuted },
 
-  heroCard: { borderRadius: UI.radius.hero, padding: UI.spacing.cardPadLg, marginTop: UI.spacing.sectionGap },
+  // HERO (compact)
+  heroCard: {
+    borderRadius: UI.radius.hero,
+    padding: UI.spacing.cardPad,
+    marginTop: UI.spacing.sectionGap,
+  },
   heroPressable: { width: "100%" },
   heroInner: { alignItems: "center" },
-  ringMetaRow: { marginTop: UI.spacing.gapSm, width: "100%", alignItems: "center" },
-  resetsText: { fontSize: 11, color: UI.colors.textMuted },
-  updatedText: { marginTop: 6, fontSize: 11, color: UI.colors.textMuted },
 
-  // Today Focus
+  heroTopRow: {
+    width: "100%",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    paddingHorizontal: 2,
+  },
+  heroLabel: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "700" },
+  heroUpdated: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "600" },
+
+  ringWrap: {
+    marginTop: 8,
+    marginBottom: 6,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  heroStatus: {
+    marginTop: 2,
+    fontSize: 15,
+    fontWeight: "700",
+    color: UI.colors.text,
+  },
+
+  // Today Focus strip
   focusCard: {
     marginTop: UI.spacing.sectionGap,
     padding: UI.spacing.cardPad,
@@ -569,24 +700,23 @@ const styles = StyleSheet.create({
     borderColor: UI.colors.homeCards.focusBorder,
   },
   focusHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between" },
-  focusTitle: { fontSize: UI.type.section, fontWeight: "700", color: UI.colors.text },
-  focusSubtitle: { fontSize: UI.type.caption, color: UI.colors.textMuted },
+  focusTitle: { fontSize: UI.type.section, fontWeight: "800", color: UI.colors.text },
+  focusSubtitle: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "600" },
 
-  focusChipsWrap: { marginTop: UI.spacing.gapSm, gap: UI.spacing.gapSm },
-  focusPill: {
+  focusStripPill: {
+    marginTop: UI.spacing.gapSm,
     borderRadius: UI.radius.inner,
-    paddingVertical: UI.spacing.pillY,
-    paddingHorizontal: UI.spacing.pillX,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     backgroundColor: UI.colors.homeCards.focusChipBg,
     borderWidth: 1,
     borderColor: UI.colors.homeCards.focusChipBorder,
   },
-  focusPillLabel: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "600" },
-  focusPillValue: { marginTop: 2, fontSize: UI.type.section, color: UI.colors.textDim },
+  focusStripText: { fontSize: UI.type.caption, color: UI.colors.textDim, fontWeight: "700" },
 
   // Best Next Meal
   bestCard: {
-    marginTop: UI.spacing.sectionGap,
+    marginTop: UI.spacing.sectionGap + 4, // a touch more breathing room
     padding: UI.spacing.cardPad,
     borderRadius: UI.radius.card,
     backgroundColor: UI.colors.homeCards.suggestBg,
@@ -594,7 +724,8 @@ const styles = StyleSheet.create({
     borderColor: UI.colors.homeCards.suggestBorder,
   },
   bestHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  bestTitle: { fontSize: UI.type.section, fontWeight: "800", color: UI.colors.text },
+  bestTitle: { fontSize: UI.type.section, fontWeight: "900", color: UI.colors.text },
+
   confPill: {
     paddingVertical: 6,
     paddingHorizontal: 10,
@@ -603,14 +734,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: UI.colors.ai.pillBorder,
   },
-  confPillText: { fontSize: UI.type.caption, color: UI.colors.ai.pillText, fontWeight: "700" },
+  confPillText: { fontSize: UI.type.caption, color: UI.colors.ai.pillText, fontWeight: "800" },
 
   recoveryText: { marginTop: UI.spacing.gapSm, fontSize: UI.type.caption, color: UI.colors.textMuted },
 
   inlineChipsWrap: { marginTop: UI.spacing.gapSm, flexDirection: "row", flexWrap: "wrap", gap: UI.spacing.gapSm },
-  inlineChipActive: {
-    borderColor: UI.colors.primary.teal,
-  },
+  inlineChipActive: { borderColor: UI.colors.primary.teal },
 
   optionList: { marginTop: UI.spacing.sectionGap, gap: UI.spacing.gapSm },
   optionCard: {
@@ -620,27 +749,29 @@ const styles = StyleSheet.create({
     borderColor: UI.colors.outline,
     padding: UI.spacing.cardPad,
   },
+  optionCardPrimary: {
+    borderColor: UI.colors.ai.pillBorder,
+  },
   optionTopRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  optionTitle: { fontSize: UI.type.rowTitle, fontWeight: "800", color: UI.colors.text, flex: 1, paddingRight: 10 },
-  optionKind: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "700" },
-
-  whyList: { marginTop: UI.spacing.gapSm, gap: 4 },
-  whyText: { fontSize: UI.type.caption, color: UI.colors.textDim },
-
+  optionTitle: { fontSize: UI.type.rowTitle, fontWeight: "900", color: UI.colors.text, flex: 1, paddingRight: 10 },
+  optionTitlePrimary: { fontSize: UI.type.rowTitle + 1 },
+  optionKind: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "800" },
+  whyText: { marginTop: 8, fontSize: UI.type.caption, color: UI.colors.textDim },
   optionCtaRow: { marginTop: UI.spacing.sectionGap },
   secondaryBtn: { minHeight: UI.sizes.buttonH },
 
   // Insights
   insightCard: { marginTop: UI.spacing.sectionGap, padding: UI.spacing.cardPad, borderRadius: UI.radius.card },
   insightHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  insightTitle: { fontSize: UI.type.section, fontWeight: "700", color: UI.colors.text },
-  insightToggle: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "700" },
+  insightTitle: { fontSize: UI.type.section, fontWeight: "800", color: UI.colors.text },
+  insightToggle: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "800" },
   insightText: { fontSize: UI.type.section, color: UI.colors.textDim },
 
-  mutedText: { fontSize: UI.type.caption, color: UI.colors.textMuted },
-
-  // Modal sheet
-  modalBackdrop: { flex: 1, backgroundColor: UI.colors.modalBackdrop },
+  // Modal / sheet
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: UI.colors.modalBackdrop,
+  },
   sheet: {
     position: "absolute",
     left: 0,
@@ -652,13 +783,37 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: UI.colors.modalBorder,
     padding: UI.spacing.cardPadLg,
+    paddingBottom: Platform.OS === "ios" ? 22 : UI.spacing.cardPadLg,
   },
   sheetHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  sheetTitle: { fontSize: UI.type.cardTitle, fontWeight: "800", color: UI.colors.text },
+  sheetTitle: { fontSize: UI.type.cardTitle, fontWeight: "900", color: UI.colors.text },
   sheetClose: { paddingVertical: 8, paddingHorizontal: 10 },
-  sheetCloseText: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "800" },
+  sheetCloseText: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "900" },
+  sheetSubtitle: { marginTop: 2, fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "800" },
+  sheetBody: { marginTop: UI.spacing.sectionGap, gap: 8 },
+  sheetLine: { fontSize: UI.type.md, color: UI.colors.textDim, lineHeight: UI.type.lineHeightMd },
 
-  sheetBody: { marginTop: UI.spacing.sectionGap },
-  sheetSubtitle: { fontSize: UI.type.caption, color: UI.colors.textMuted, fontWeight: "700" },
-  sheetText: { marginTop: 8, fontSize: UI.type.md, color: UI.colors.textDim, lineHeight: UI.type.lineHeightMd },
+  sheetActionsRow: { flexDirection: "row", gap: 12, marginTop: 16 },
+  sheetBtnGhost: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: UI.colors.outlineStrong,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: UI.colors.btnBg,
+  },
+  sheetBtnGhostText: { color: UI.colors.text, fontWeight: "800" },
+  sheetBtnPrimary: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(111,174,217,0.18)",
+    borderWidth: 1,
+    borderColor: "rgba(111,174,217,0.35)",
+  },
+  sheetBtnPrimaryText: { color: UI.colors.text, fontWeight: "900" },
 });

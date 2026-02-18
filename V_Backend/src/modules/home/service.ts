@@ -223,6 +223,52 @@ function makeIntentId(ctx: { userId: string; memberId: string }, now: Date) {
   return `bni_${ctx.userId}_${ctx.memberId}_${day}`;
 }
 
+
+function applyAiIdeasToEatoutOnly(options: DishOption[], aiIdeas: DishIdea[]): DishOption[] {
+  const next = [...options];
+  let j = 0;
+  for (let i = 0; i < next.length && j < aiIdeas.length; i++) {
+    if (next[i].mode !== "eatout") continue;
+    next[i] = {
+      ...next[i],
+      title: aiIdeas[j]?.title || next[i].title,
+      searchKey: aiIdeas[j]?.query || next[i].searchKey,
+      tags: Array.isArray(aiIdeas[j]?.tags) && aiIdeas[j]!.tags!.length
+        ? aiIdeas[j]!.tags!.slice(0, 2)
+        : next[i].tags,
+    };
+    j++;
+  }
+  return next;
+}
+
+
+function riskRank(r: any): number {
+  if (r === "high") return 3;
+  if (r === "medium") return 2;
+  return 1; // low
+}
+
+function pickTopWatchout(summary: any): { label: string; valueText: string } | null {
+  if (!summary) return null;
+
+  const sugar = summary.sugarRisk;
+  const sodium = summary.sodiumRisk;
+
+  const sugarRank = riskRank(sugar);
+  const sodiumRank = riskRank(sodium);
+
+  // Only show if medium/high
+  const bestRank = Math.max(sugarRank, sodiumRank);
+  if (bestRank < 2) return null;
+
+  // Tie-breaker: prefer sodium (more “control” narrative)
+  if (sodiumRank === bestRank) return { label: "Watchout", valueText: `Sodium ${sodium}` };
+  return { label: "Watchout", valueText: `Sugar ${sugar}` };
+}
+
+
+
 // --- Tiny TTL cache (server process local, small TTL, safe for v1)
 type CacheEntry<T> = { expiresAt: number; value: T };
 const homePlanCache = new Map<string, CacheEntry<any>>();
@@ -250,27 +296,25 @@ type MacroPlanBundle = {
 };
 
 
-function patchPlanSearchKeyFromRefined(
-  plan: any | null,
-  refinedOptions: DishOption[]
-) {
+function patchPlanSearchKeyFromRefined(plan: any | null, refinedOptions: DishOption[]) {
   if (!plan || !refinedOptions?.length) return plan;
 
-  const primaryKey = refinedOptions[0]?.searchKey || refinedOptions[0]?.title;
-  if (!primaryKey) return plan;
+  const firstEatout = refinedOptions.find(o => o.mode === "eatout");
+  const eatoutKey = firstEatout?.searchKey || firstEatout?.title;
+  if (!eatoutKey) return plan;
 
-  // Only patch if plan uses goEatOut
   if (plan?.actions?.goEatOut && typeof plan.actions.goEatOut.searchKey === "string") {
     return {
       ...plan,
       actions: {
         ...plan.actions,
-        goEatOut: { searchKey: primaryKey },
+        goEatOut: { searchKey: eatoutKey },
       },
     };
   }
   return plan;
 }
+
 
 
 function prefsFingerprint(prefs: any): string {
@@ -605,7 +649,9 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
 
   // ---- AI refinement (Sync-only, daily-only, never blocks)
   let refinedOptions = deterministicOptions;
-  let restaurantSearchKey: string | null = refinedOptions[0]?.searchKey ?? null;
+  let restaurantSearchKey: string | null =
+  refinedOptions.find(o => o.mode === "eatout")?.searchKey ?? null;
+
 
   if (opts.window === "daily" && syncOn && refinedOptions.length) {
 
@@ -647,14 +693,17 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
           );
 
           if (ai?.ideas?.length) {
-            refinedOptions = mergeAiIdeasIntoOptions(refinedOptions, ai.ideas);
+            refinedOptions = applyAiIdeasToEatoutOnly(refinedOptions, ai.ideas);
 
             // Keep authoritative plan aligned with refined primary option (Sync-only refinement)
             if (opts.window === "daily" && macroBundle?.plan) {
               macroBundle.plan = patchPlanSearchKeyFromRefined(macroBundle.plan, refinedOptions);
             }
 
-            restaurantSearchKey = ai.searchKey || refinedOptions[0]?.searchKey || restaurantSearchKey;
+            const firstEatoutAfterAi = refinedOptions.find(o => o.mode === "eatout");
+restaurantSearchKey =
+  ai.searchKey || firstEatoutAfterAi?.searchKey || restaurantSearchKey;
+
           }
         } catch {
           // swallow: Home must never block
@@ -664,6 +713,7 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
   }
 
   // ---- Fallback if no AI + no deterministic (shouldn't happen, but safe)
+
   if (opts.window === "daily" && bestNextMeal && (!refinedOptions || !refinedOptions.length)) {
     refinedOptions = buildDeterministicOptions({
       bestTitle: bestNextMeal.title,
@@ -681,13 +731,37 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
   let todaysFocus: any = null;
   let suggestion: any = null;
 
+  const mgSummary = macroBundle?.intent?.context?.macroGap?.summary ?? null;
+  const tw = macroBundle?.intent?.context?.timeWindow ?? null;
+  
   if (opts.window === "daily" && vector && todayTotals) {
+    const chips: Array<{ key: string; label: string; valueText: string }> = [];
+  
+    // Alignment (prefer Protein; if not meaningful, show Fiber)
+    if (mgSummary?.proteinGap_g && mgSummary.proteinGap_g >= 10) {
+      chips.push({ key: "align", label: "Alignment", valueText: `Protein +${Math.round(mgSummary.proteinGap_g)}g` });
+    } else if (mgSummary?.fiberGap_g && mgSummary.fiberGap_g >= 4) {
+      chips.push({ key: "align", label: "Alignment", valueText: `Fiber +${Math.round(mgSummary.fiberGap_g)}g` });
+    }
+  
+    // Watchout (top only)
+    const top = pickTopWatchout(mgSummary);
+    if (top) chips.push({ key: "watch", label: top.label, valueText: top.valueText });
+  
+    // Budget
+    if (Number.isFinite(mgSummary?.caloriesRemaining)) {
+      chips.push({ key: "budget", label: "Budget", valueText: `${Math.round(mgSummary.caloriesRemaining)} cal left` });
+    }
+  
+    // Window
+    if (tw) {
+      const w = String(tw);
+      chips.push({ key: "win", label: "Window", valueText: w.charAt(0).toUpperCase() + w.slice(1) });
+    }
+  
     todaysFocus = {
-      title: "Today’s Focus",
-      chips: [
-        { key: "deficit", label: "Deficit", valueText: vector.deficitOfDay?.text ?? "—" },
-        { key: "risk", label: "Risk", valueText: vector.overRisk?.text ?? "—" },
-      ],
+      title: "Today Focus",
+      chips: chips.slice(0, 4),
       totals: todayTotals,
     };
 
@@ -701,7 +775,7 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
     const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
     const confidenceLabel = suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
 
-    // Prefer plan’s primary action searchKey (authoritative), fallback to refined option
+    const firstEatout = refinedOptions.find(o => o.mode === "eatout");
     const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
 
 
@@ -726,7 +800,7 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
           executionPlan,
 
           // keep current routing field alive for current EatOut
-          route: { searchKey: planSearchKey ?? refinedOptions[0]?.searchKey ?? restaurantSearchKey ?? "" },
+          route: { searchKey: planSearchKey ?? firstEatout?.searchKey ?? restaurantSearchKey ?? "" },
         }
         : null;
 

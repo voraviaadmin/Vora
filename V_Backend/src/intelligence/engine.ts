@@ -225,6 +225,46 @@ export const DEFAULT_INTELLIGENCE_CONFIG: IntelligenceConfig = {
   },
 };
 
+
+function buildCookPlanFromIntent(intent: {
+  proteinGap_g: number;
+  caloriesRemaining?: number | null;
+  cuisineHint?: string | null;
+  sugarRisk?: string | null;
+  sodiumRisk?: string | null;
+}) {
+  const proteinTarget = Math.max(30, Math.min(intent.proteinGap_g || 40, 60));
+
+  const cuisine = (intent.cuisineHint || "balanced").toLowerCase();
+
+  // Simple cuisine mapping
+  let base = "Lean Protein Bowl";
+  if (cuisine.includes("thai")) base = "Thai Lean Basil Bowl";
+  if (cuisine.includes("japanese")) base = "Japanese Protein Bowl";
+  if (cuisine.includes("mediterranean")) base = "Mediterranean Chicken Bowl";
+
+  const ingredients = [
+    { ingredient: "Chicken breast", grams: Math.round(proteinTarget * 3) },
+    { ingredient: "Mixed vegetables", grams: 150 },
+    { ingredient: "Cooked rice or quinoa", grams: 120 },
+    { ingredient: "Olive oil", grams: 5 },
+    { ingredient: "Fresh herbs or lemon", grams: 10 },
+  ];
+
+  return {
+    dishName: base,
+    ingredients,
+    prepModules: [
+      { step: 1, action: "Preheat pan", temperatureC: 190 },
+      { step: 2, action: "Add olive oil" },
+      { step: 3, action: "Cook chicken 5 min per side", timeMinutes: 10 },
+      { step: 4, action: "Add vegetables 3–4 min", timeMinutes: 4 },
+      { step: 5, action: "Assemble and serve" },
+    ],
+    totalMinutes: 12,
+  };
+}
+
 // ----------------------------
 // Public API (exactly 3 exports)
 // ----------------------------
