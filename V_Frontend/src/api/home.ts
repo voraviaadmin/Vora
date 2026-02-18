@@ -26,6 +26,7 @@ export type HomeSummaryResponse = {
     statusWord: string; // "Good"
     description: string; // calm guidance
     confidence?: number | null;
+    onTrack?: { tier: "high" | "medium" | "low"; label: string; score: number } | null;
   };
 
   actions: {

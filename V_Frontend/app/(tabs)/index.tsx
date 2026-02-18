@@ -215,7 +215,7 @@ function pickTopWatchout(mgSummary: any): { label: string; valueText: string } |
   if (sugarSev === 0 && sodiumSev === 0) return null;
 
   if (sugarSev >= sodiumSev) {
-    return {label: "Sugar", valueText: `${String(sugar).toUpperCase()}` };
+    return { label: "Sugar", valueText: `${String(sugar).toUpperCase()}` };
   }
   return { label: "Sodium", valueText: `${String(sodium).toUpperCase()}` };
 }
@@ -279,6 +279,9 @@ export default function HomeScreen() {
 
   const [window, setWindow] = useState<HomeWindow>("daily");
   const { data: home, refetch } = useHomeSummary(window, 5);
+
+
+
 
   useFocusEffect(
     React.useCallback(() => {
@@ -396,13 +399,15 @@ export default function HomeScreen() {
   const ringSize = Math.round((UI.sizes?.ringSize ?? 240) * 0.72);
   const ringStroke = Math.max(10, Math.round((UI.sizes?.ringStroke ?? 18) * 0.78));
 
+  const onTrack = home?.heroScore?.onTrack;
+
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.container}>
       {/* Header (clean, premium) */}
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <Text style={styles.appTitle}>Voravia</Text>
-          <Button title="Logout" variant="ghost" onPress={() => {}} style={styles.logoutBtn} />
+          <Button title="Logout" variant="ghost" onPress={() => { }} style={styles.logoutBtn} />
         </View>
 
         <View style={styles.headerMetaRow}>
@@ -424,11 +429,20 @@ export default function HomeScreen() {
           <View style={styles.heroInner}>
             <View style={styles.heroTopRow}>
               <Text style={styles.heroLabel}>{hero?.label ?? "Daily Score"}</Text>
-              {typeof updatedMin === "number" ? (
+              {/*{typeof updatedMin === "number" ? (
                 <Text style={styles.heroUpdated}>{C.micro.updated(updatedMin)}</Text>
               ) : (
                 <Text style={styles.heroUpdated} />
-              )}
+              )}*/}
+
+              {window === "daily" && onTrack ? (
+                <View style={styles.onTrackPill}>
+                  <Text style={styles.onTrackText}>Day On track: {onTrack.label}</Text>
+                </View>
+              ) : null}
+
+
+
             </View>
 
             <View style={styles.ringWrap}>
@@ -444,8 +458,11 @@ export default function HomeScreen() {
               />
             </View>
 
-            <Text style={styles.heroStatus}>{hero?.statusWord ?? "Start"}</Text>
+            <Text style={styles.onTrackText}>{hero?.statusWord ?? "Start"}</Text>
           </View>
+
+
+
         </Pressable>
       </Card>
 
@@ -615,7 +632,7 @@ export default function HomeScreen() {
       </Modal>
 
       {/* DEV ONLY */}
-     {/* {__DEV__ ? (
+      {/* {__DEV__ ? (
         <DevStatusCard
           backendOk={isPrivacy ? true : backendOk}
           backendLabel={isPrivacy ? "Disabled (Privacy Mode)" : undefined}
@@ -689,6 +706,17 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: UI.colors.text,
   },
+  onTrackPill: {
+    marginTop: 6,
+    alignSelf: "center",
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: UI.radius.inner,
+    backgroundColor: UI.colors.homeCards?.focusChipBg ?? "rgba(255,255,255,0.08)",
+    borderWidth: 1,
+    borderColor: UI.colors.homeCards?.focusChipBorder ?? "rgba(255,255,255,0.12)",
+  },
+  onTrackText: { fontSize: UI.type.caption, fontWeight: "700", color: UI.colors.textMuted },
 
   // Today Focus strip
   focusCard: {

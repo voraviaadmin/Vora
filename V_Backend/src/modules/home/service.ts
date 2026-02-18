@@ -151,10 +151,10 @@ function statusForScore(score: number, hasData: boolean) {
   if (!hasData) {
     return { statusWord: "Start", description: "Log a meal to build your daily score." };
   }
-  if (score >= 80) return { statusWord: "Excellent", description: "Keep it steady. Small choices add up." };
-  if (score >= 65) return { statusWord: "Good", description: "A couple smart choices will help." };
-  if (score >= 50) return { statusWord: "Okay", description: "You’re close. One balanced meal can lift today." };
-  return { statusWord: "Steady", description: "A protein + fiber combo can help next." };
+  if (score >= 80) return { statusWord: "Excellent (logged meals so far)", description: "Keep it steady. Small choices add up." };
+  if (score >= 65) return { statusWord: "Good (logged meals so far)", description: "A couple smart choices will help." };
+  if (score >= 50) return { statusWord: "Okay (logged meals so far)", description: "You’re close. One balanced meal can lift today." };
+  return { statusWord: "Steady (logged meals so far)", description: "A protein + fiber combo can help next." };
 }
 
 function safeJsonParse(v: any): any | null {
@@ -187,11 +187,12 @@ function clampStr(s: any, max: number) {
   return v.length > max ? v.slice(0, max) : v;
 }
 
-function clamp01(n: any) {
+/*function clamp01(n: any) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   return Math.max(0, Math.min(1, v));
-}
+}*/
+
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -502,6 +503,148 @@ function buildExecutionPlanFromOptions(options: DishOption[]): ExecutionPlan | n
   };
 }
 
+
+type TimeWindow = "breakfast" | "lunch" | "snack" | "dinner";
+
+type MacroGapSummary = {
+  proteinGap_g: number;
+  fiberGap_g: number;
+  caloriesRemaining: number;
+  sugarRisk: "low" | "medium" | "high";
+  sodiumRisk: "low" | "medium" | "high";
+};
+
+export type OnTrackTier = "high" | "medium" | "low";
+
+export type OnTrackResult = {
+  tier: OnTrackTier;
+  label: string;        // "On track: High"
+  short: string;        // "High" (for pill)
+  rationale: string[];  // 1–3 bullets for Insights / Details
+  score: number;        // 0..100 internal, useful for debugging/telemetry
+};
+
+function clamp01(n: number) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function riskPenalty(r: "low" | "medium" | "high") {
+  if (r === "high") return 14;
+  if (r === "medium") return 7;
+  return 0;
+}
+
+/**
+ * Deterministic "On-track" evaluator.
+ * - Interprets remaining gaps vs remaining day runway (timeWindow)
+ * - Adds a small penalty when coverage is low (few meals logged / low estimate coverage)
+ *
+ * Inputs:
+ * - mg: macroGap.summary
+ * - tw: time window
+ * - logsCount: how many meals logged today (or use estimateCoverage-derived count)
+ * - estimateCoverage: 0..1 (optional). If you have it, pass it.
+ */
+export function computeOnTrackTier(input: {
+  mg: MacroGapSummary | null | undefined;
+  tw: TimeWindow | null | undefined;
+  logsCount?: number | null;
+  estimateCoverage?: number | null; // 0..1
+}): OnTrackResult {
+  const mg = input.mg ?? null;
+  const tw = input.tw ?? null;
+
+  // Safe fallback: if we can’t compute, be conservative.
+  if (!mg || !tw) {
+    return {
+      tier: "medium",
+      short: "Medium",
+      label: "On track: Medium",
+      rationale: ["Not enough context yet — log one more meal for a clearer pace."],
+      score: 55,
+    };
+  }
+
+  const proteinGap = Math.max(0, Number(mg.proteinGap_g) || 0);
+  const caloriesLeft = Math.max(0, Number(mg.caloriesRemaining) || 0);
+
+  // “Runway” = how much of the day is realistically left to correct course.
+  // You can tune these without breaking clients.
+  const runway = (() => {
+    if (tw === "breakfast") return { proteinOK: 95, proteinWarn: 130, calOK: 900, calWarn: 1250, name: "Breakfast" };
+    if (tw === "lunch") return { proteinOK: 70, proteinWarn: 110, calOK: 700, calWarn: 1000, name: "Lunch" };
+    if (tw === "snack") return { proteinOK: 55, proteinWarn: 90, calOK: 500, calWarn: 800, name: "Snack" };
+    // dinner: least runway left
+    return { proteinOK: 35, proteinWarn: 65, calOK: 350, calWarn: 650, name: "Dinner" };
+  })();
+
+  // Base score starts at 100 and we subtract penalties.
+  let score = 100;
+
+  // Protein gap penalty (bigger gap later in day hurts more)
+  if (proteinGap > runway.proteinWarn) score -= 40;
+  else if (proteinGap > runway.proteinOK) score -= 22;
+  else score -= 8; // even small gap still “some work remaining”
+
+  // Calorie budget penalty (too little remaining late makes “on-track” harder)
+  if (caloriesLeft < 120) score -= 28;
+  else if (caloriesLeft < runway.calOK) score -= 12;
+  else if (caloriesLeft < runway.calWarn) score -= 6;
+  else score -= 2;
+
+  // Risk penalty: high sugar/sodium makes execution harder to stay “on track”
+  score -= riskPenalty(mg.sugarRisk);
+  score -= riskPenalty(mg.sodiumRisk);
+
+  // Coverage penalty: if we’ve logged very little, we’re less certain you’re on pace.
+  const logsCount = Math.max(0, Number(input.logsCount ?? 0) || 0);
+  const coverage = typeof input.estimateCoverage === "number"
+    ? clamp01(input.estimateCoverage)
+    : null;
+
+  if (coverage != null) {
+    if (coverage < 0.35) score -= 12;
+    else if (coverage < 0.6) score -= 6;
+  } else {
+    // fallback based on logs count
+    if (logsCount === 0) score -= 14;
+    else if (logsCount === 1) score -= 8;
+    else if (logsCount === 2) score -= 4;
+  }
+
+  // Clamp final score 0..100
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  const tier: OnTrackTier =
+    score >= 72 ? "high" :
+      score >= 48 ? "medium" : "low";
+
+  const short = tier === "high" ? "High" : tier === "medium" ? "Medium" : "Low";
+  const label = `On track: ${short}`;
+
+  // Rationale (for Insights/Details). Keep it calm + executive.
+  const rationale: string[] = [];
+
+  // 1) Runway framing
+  rationale.push(`${runway.name} runway: prioritize one strong execution move.`);
+
+  // 2) Biggest gap
+  if (proteinGap >= 10) rationale.push(`Protein remaining: ~${Math.round(proteinGap)}g.`);
+
+  // 3) Top watchout
+  const topWatch =
+    mg.sugarRisk === "high" ? "Sugar is high — keep the next choice low-sugar." :
+      mg.sodiumRisk === "high" ? "Sodium is high — keep the next choice low-sodium." :
+        mg.sugarRisk === "medium" ? "Sugar is trending up — avoid sweet drinks." :
+          mg.sodiumRisk === "medium" ? "Sodium is trending up — go lighter on sauces." :
+            null;
+  if (topWatch) rationale.push(topWatch);
+
+  return { tier, short, label, rationale: rationale.slice(0, 3), score };
+}
+
+
 /* -------------------------------- Service -------------------------------- */
 
 export async function getHomeSummary(req: Request, opts: { window: HomeWindow; limit: number }) {
@@ -597,8 +740,8 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
   const prefsKey = syncOn ? prefsFingerprint(userPrefs) : "";
   const day = startOfLocalDayIso(now).slice(0, 10);
   const planCacheKey = `home_plan_v1:${ctx.userId}:${subjectMemberId}:${day}:${syncMode}:${prefsKey}`;
-  const cacheKey = `macro_v1:${ctx.userId}:${subjectMemberId}:${now.toISOString().slice(0,10)}:${syncMode}:${prefsKey}`;
- 
+  const cacheKey = `macro_v1:${ctx.userId}:${subjectMemberId}:${now.toISOString().slice(0, 10)}:${syncMode}:${prefsKey}`;
+
 
   type MacroPlanBundle = {
     intent: any;        // BestNextMealIntent from macro-gap.ts
@@ -650,7 +793,7 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
   // ---- AI refinement (Sync-only, daily-only, never blocks)
   let refinedOptions = deterministicOptions;
   let restaurantSearchKey: string | null =
-  refinedOptions.find(o => o.mode === "eatout")?.searchKey ?? null;
+    refinedOptions.find(o => o.mode === "eatout")?.searchKey ?? null;
 
 
   if (opts.window === "daily" && syncOn && refinedOptions.length) {
@@ -701,8 +844,8 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
             }
 
             const firstEatoutAfterAi = refinedOptions.find(o => o.mode === "eatout");
-restaurantSearchKey =
-  ai.searchKey || firstEatoutAfterAi?.searchKey || restaurantSearchKey;
+            restaurantSearchKey =
+              ai.searchKey || firstEatoutAfterAi?.searchKey || restaurantSearchKey;
 
           }
         } catch {
@@ -733,50 +876,60 @@ restaurantSearchKey =
 
   const mgSummary = macroBundle?.intent?.context?.macroGap?.summary ?? null;
   const tw = macroBundle?.intent?.context?.timeWindow ?? null;
-  
+
+  const countedRowsToday =
+  opts.window === "daily" ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length : 0;
+
+const totalRowsToday = opts.window === "daily" ? rows.length : 0;
+const estimateCoverage = totalRowsToday > 0 ? countedRowsToday / totalRowsToday : 0;
+
+const behaviorConfidence = behavior14d ? 1 : 0;
+const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
+const confidenceLabel = suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
+
+const firstEatout = refinedOptions.find(o => o.mode === "eatout");
+const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
+
+  // You already compute estimateCoverage in service.ts
+  const onTrack = computeOnTrackTier({
+    mg: mgSummary,
+    tw,
+    logsCount: normalized?.length ?? 0,
+    estimateCoverage, // if available
+  });
+
   if (opts.window === "daily" && vector && todayTotals) {
     const chips: Array<{ key: string; label: string; valueText: string }> = [];
-  
+
     // Alignment (prefer Protein; if not meaningful, show Fiber)
     if (mgSummary?.proteinGap_g && mgSummary.proteinGap_g >= 10) {
       chips.push({ key: "align", label: "Alignment", valueText: `Protein +${Math.round(mgSummary.proteinGap_g)}g` });
     } else if (mgSummary?.fiberGap_g && mgSummary.fiberGap_g >= 4) {
       chips.push({ key: "align", label: "Alignment", valueText: `Fiber +${Math.round(mgSummary.fiberGap_g)}g` });
     }
-  
+
     // Watchout (top only)
     const top = pickTopWatchout(mgSummary);
     if (top) chips.push({ key: "watch", label: top.label, valueText: top.valueText });
-  
+
     // Budget
     if (Number.isFinite(mgSummary?.caloriesRemaining)) {
       chips.push({ key: "budget", label: "Budget", valueText: `${Math.round(mgSummary.caloriesRemaining)} cal left` });
     }
-  
+
     // Window
     if (tw) {
       const w = String(tw);
       chips.push({ key: "win", label: "Window", valueText: w.charAt(0).toUpperCase() + w.slice(1) });
     }
-  
+
     todaysFocus = {
       title: "Today Focus",
       chips: chips.slice(0, 4),
       totals: todayTotals,
     };
 
-    const countedRowsToday =
-      opts.window === "daily" ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length : 0;
 
-    const totalRowsToday = opts.window === "daily" ? rows.length : 0;
-    const estimateCoverage = totalRowsToday > 0 ? countedRowsToday / totalRowsToday : 0;
-
-    const behaviorConfidence = behavior14d ? 1 : 0;
-    const suggestionConfidence = clamp01(0.55 * estimateCoverage + 0.45 * behaviorConfidence);
-    const confidenceLabel = suggestionConfidence >= 0.75 ? "high" : suggestionConfidence >= 0.45 ? "medium" : "low";
-
-    const firstEatout = refinedOptions.find(o => o.mode === "eatout");
-    const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
 
 
     suggestion =
@@ -828,6 +981,8 @@ restaurantSearchKey =
       statusWord: status.statusWord,
       description: status.description,
       confidence: null,
+        // ✅ add this
+  onTrack: { tier: onTrack.tier, label: onTrack.short, score: onTrack.score },
     },
     actions: {
       primaryCta: { id: "scan_food", title: "Scan Food", subtitle: null },
