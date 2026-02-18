@@ -16,6 +16,7 @@ import {
   Pressable,
   Modal,
   Platform,
+  Alert,
 } from "react-native";
 import { useFocusEffect, router } from "expo-router";
 
@@ -34,6 +35,8 @@ import { Ring } from "../../components/ui/Ring";
 // DEV ONLY
 import { DevStatusCard } from "../../components/dev/DevStatusCard";
 import { useModeGate } from "../../src/hooks/use-mode-gate";
+import type { HomeSummary } from "../../src/contracts/home";
+import { acceptDailyContract, adjustDailyContract } from "../../src/api/home";
 
 const WINDOW_ORDER: HomeWindow[] = ["daily", "3d", "7d", "14d"];
 function nextWindow(w: HomeWindow): HomeWindow {
@@ -279,6 +282,46 @@ export default function HomeScreen() {
 
   const [window, setWindow] = useState<HomeWindow>("daily");
   const { data: home, refetch } = useHomeSummary(window, 5);
+  const [contractAdjustOpen, setContractAdjustOpen] = useState(false);
+  const [contractOpen, setContractOpen] = useState(false);
+
+  useEffect(() => {
+    // reset when day changes / new contract id arrives
+    if (home?.dailyContract?.id) setContractOpen(false);
+  }, [home?.dailyContract?.id]);
+
+
+  const [localContractStatus, setLocalContractStatus] =
+    useState<"draft" | "active" | "completed" | "failed" | "expired" | null>(null);
+
+  useEffect(() => {
+    setLocalContractStatus(null); // reset when new contract arrives
+  }, [home?.dailyContract?.id]);
+
+
+  const contractStatus =
+    localContractStatus ?? home?.dailyContract?.status ?? "draft";
+
+
+  const onAcceptContract = async () => {
+    if (!home?.dailyContract?.id) return;
+
+    try {
+      await acceptDailyContract(); // POST /home/daily-contract/accept
+      await refetch(); // CRITICAL
+      console.log("After accept", home?.dailyContract);
+    } catch (e) {
+      console.warn("Accept failed", e);
+    }
+  };
+
+
+  const onAdjustContract = async () => {
+    setContractAdjustOpen(true);
+    // when user hits Save: await adjustDailyContract(...); refetch();
+  };
+
+
 
 
 
@@ -485,6 +528,121 @@ export default function HomeScreen() {
         </Pressable>
       </Card>
 
+
+
+      {/* Today Contract — single strip (action-first) */}
+      {home?.dailyContract ? (
+        <Card style={styles.contractCard}>
+          <Pressable
+            onPress={() => setContractOpen((v) => !v)}
+            accessibilityRole="button"
+            accessibilityLabel="Toggle today contract"
+            style={{ width: "100%" }}
+          >
+            <View style={styles.contractHeaderRow}>
+              <Text style={styles.contractTitle}>Today’s Contract</Text>
+
+              <View style={styles.contractHeaderRight}>
+                <View style={styles.contractStatusPill}>
+                  <Text style={styles.contractStatusText}>
+                    {home.dailyContract.status === "completed"
+                      ? "Done"
+                      : home.dailyContract.status === "active"
+                        ? "Locked"
+                        : "Draft"}
+                  </Text>
+                </View>
+
+                <Text style={styles.contractChevron}>{contractOpen ? "▾" : "▸"}</Text>
+              </View>
+            </View>
+
+            {/* Collapsed one-line summary (always shown) */}
+            <Text style={styles.contractSummary} numberOfLines={1}>
+              <Text style={styles.contractSummaryStrong}>{home.dailyContract.title}</Text>
+              {" — "}
+              {home.dailyContract.metric?.unit === "g"
+                ? `+${Math.round(home.dailyContract.metric?.target ?? 0)}g today`
+                : home.dailyContract.statement ?? "Execute one clean decision."}
+              {"  •  "}
+              {Math.round(home.dailyContract.progress?.current ?? 0)}/
+              {Math.round(home.dailyContract.progress?.target ?? 0)}
+              {home.dailyContract.metric?.unit ?? ""}
+            </Text>
+          </Pressable>
+
+          {/* Expanded */}
+          {contractOpen ? (
+            <View style={{ marginTop: 10 }}>
+              <Text style={styles.contractStatement} numberOfLines={1}>
+                {home.dailyContract.statement ?? "Execute one clean decision."}
+              </Text>
+
+              <Text style={styles.contractProgressText}>
+                {Math.round(home.dailyContract.progress?.current ?? 0)} /{" "}
+                {Math.round(home.dailyContract.progress?.target ?? 0)}
+                {home.dailyContract.metric?.unit ?? ""}
+              </Text>
+
+              <View style={styles.contractCtaRow}>
+
+
+                <View style={styles.contractCtaRow}>
+                  {contractStatus === "draft" && (
+                    <>
+                      <Pressable
+                        onPress={onAcceptContract}
+                        style={styles.contractAcceptBtn}
+                      >
+                        <Text style={styles.contractAcceptBtnText}>Accept</Text>
+                      </Pressable>
+
+                      <Pressable
+                        onPress={onAdjustContract}
+                        style={styles.contractAdjustBtn}
+                      >
+                        <Text style={styles.contractAdjustBtnText}>Adjust</Text>
+                      </Pressable>
+                    </>
+                  )}
+
+                  {contractStatus === "active" && (
+                    <View style={styles.contractLockedRow}>
+                      <Text style={styles.contractLockedText}>
+                        Committed for today
+                      </Text>
+                    </View>
+                  )}
+
+                  {contractStatus === "completed" && (
+                    <View style={styles.contractCompletedRow}>
+                      <Text style={styles.contractCompletedText}>
+                        Completed
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
+
+
+
+                <Pressable onPress={onAdjustContract} style={styles.contractAdjustBtn}>
+                  <Text style={styles.contractAdjustBtnText}>Adjust</Text>
+                </Pressable>
+
+
+              </View>
+            </View>
+          ) : null}
+        </Card>
+      ) : null}
+
+
+
+
+
+
+
       {/* Best Next Meal — the ONE decision block */}
       <Card style={styles.bestCard}>
         <View style={styles.bestHeader}>
@@ -630,6 +788,54 @@ export default function HomeScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* Adjust Contract Sheet */}
+      <Modal
+        visible={contractAdjustOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setContractAdjustOpen(false)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setContractAdjustOpen(false)}>
+          <View />
+        </Pressable>
+
+        <View style={styles.sheet}>
+          <View style={styles.sheetHeader}>
+            <Text style={styles.sheetTitle}>Adjust Contract</Text>
+            <Pressable onPress={() => setContractAdjustOpen(false)} style={styles.sheetClose}>
+              <Text style={styles.sheetCloseText}>Close</Text>
+            </Pressable>
+          </View>
+
+          <Text style={styles.sheetSubtitle}>
+            Small changes only (keeps the plan stable)
+          </Text>
+
+          <View style={{ marginTop: 14, gap: 10 }}>
+            <Text style={styles.sheetLine}>• Target: ±20% (coming next)</Text>
+            <Text style={styles.sheetLine}>• Lock cuisine (coming next)</Text>
+            <Text style={styles.sheetLine}>• Swap protein ↔ fiber (coming next)</Text>
+          </View>
+
+          <View style={styles.sheetActionsRow}>
+            <Pressable onPress={() => setContractAdjustOpen(false)} style={styles.sheetBtnGhost}>
+              <Text style={styles.sheetBtnGhostText}>Cancel</Text>
+            </Pressable>
+
+            <Pressable
+              onPress={() => {
+                // v1: just close
+                setContractAdjustOpen(false);
+              }}
+              style={styles.sheetBtnPrimary}
+            >
+              <Text style={styles.sheetBtnPrimaryText}>Save</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
 
       {/* DEV ONLY */}
       {/* {__DEV__ ? (
@@ -844,4 +1050,162 @@ const styles = StyleSheet.create({
     borderColor: "rgba(111,174,217,0.35)",
   },
   sheetBtnPrimaryText: { color: UI.colors.text, fontWeight: "900" },
+
+
+
+
+  contractCard: {
+    marginTop: UI.spacing.sectionGap,
+    padding: UI.spacing.cardPad,
+    borderRadius: UI.radius.card,
+    backgroundColor: UI.colors.homeCards.suggestBg,
+    borderWidth: 1,
+    borderColor: UI.colors.homeCards.suggestBorder,
+  },
+
+  contractHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  contractTitle: {
+    fontSize: UI.type.section,     // same as Best Next Meal title size family
+    fontWeight: "900",
+    color: UI.colors.text,
+  },
+
+  contractHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+
+  contractChevron: {
+    fontSize: UI.type.caption,
+    color: UI.colors.textMuted,
+    fontWeight: "900",
+  },
+
+  contractStatusPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: UI.colors.ai.pillBg,
+    borderWidth: 1,
+    borderColor: UI.colors.ai.pillBorder,
+  },
+
+  contractStatusText: {
+    fontSize: UI.type.caption,
+    fontWeight: "800",
+    color: UI.colors.ai.pillText,
+  },
+
+  contractSummary: {
+    marginTop: 10,
+    fontSize: UI.type.caption,     // KEY: keep it in the “strip text” size
+    color: UI.colors.textDim,
+    fontWeight: "800",
+  },
+
+  contractSummaryStrong: {
+    color: UI.colors.text,
+    fontWeight: "900",
+  },
+
+  contractStatement: {
+    fontSize: UI.type.caption,     // keep it compact
+    color: UI.colors.textDim,
+    fontWeight: "800",
+  },
+
+  contractProgressText: {
+    marginTop: 6,
+    fontSize: UI.type.caption,
+    color: UI.colors.textMuted,
+    fontWeight: "800",
+  },
+
+  contractCtaRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 12,
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  contractAcceptBtn: {
+    flex: 1,
+    height: 44,
+    borderRadius: UI.radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: UI.colors.ai.pillBg,     // theme-consistent
+    borderWidth: 1,
+    borderColor: UI.colors.ai.pillBorder,
+  },
+
+  contractAcceptBtnText: {
+    color: UI.colors.ai.pillText,
+    fontWeight: "900",
+  },
+
+  contractAdjustBtn: {
+    flex: 1,
+    height: 44,
+    borderRadius: UI.radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: UI.colors.btnBg,
+    borderWidth: 1,
+    borderColor: UI.colors.btnBorder,
+  },
+
+  contractAdjustBtnText: {
+    color: UI.colors.btnText,
+    fontWeight: "900",
+  },
+
+
+  contractStatementStrong: {
+    fontWeight: "900",
+  },
+
+  contractLockedRow: {
+    flex: 1,
+    height: 46,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: UI.colors.outlineStrong,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: UI.colors.btnBg,
+    opacity: 0.75,
+  },
+  contractLockedText: {
+    fontSize: UI.type.caption,
+    fontWeight: "800",
+    color: UI.colors.textMuted,
+  },
+
+  contractCompletedRow: {
+    flex: 1,
+    height: 46,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: UI.colors.ai.pillBorder,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: UI.colors.ai.pillBg,
+  },
+  
+  contractCompletedText: {
+    fontSize: UI.type.caption,
+    fontWeight: "800",
+    color: UI.colors.ai.pillText,
+  },
+  
+
+
 });

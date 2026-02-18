@@ -15,5 +15,17 @@ export function meRouter() {
     res.json(out);
   });
 
+  r.post("/daily-contract/accept", async (req, res) => {
+    const { contractId } = req.body ?? {};
+    // TODO: persist accepted status in DB (phase v1 can be in-memory or store in user/day table)
+    return res.json({ ok: true });
+  });
+  
+  r.post("/daily-contract/adjust", async (req, res) => {
+    // bounded changes: target +-20%, cuisine lock, swap protein/fiber
+    return res.json({ ok: true });
+  });
+  
+
   return r;
 }

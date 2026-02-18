@@ -9,6 +9,11 @@ import { computeTodayTotals, compute14DayBehavior } from "../logs/service";
 import { decryptProfile } from "../profile/crypto";
 import { buildMacroGapExecutionPlan } from "../../intelligence/macro-gap";
 import type { BestNextMealIntent as MacroIntent, ExecutionPlan as MacroPlan } from "../../intelligence/macro-gap";
+import { computeDailyContract, evaluateContractProgress } from "../../intelligence/dailyContract";
+import { getDailyContract, insertDailyContract, updateDailyContractProgress } from "./contracts.store";
+import { contractToRow, rowToApi } from "./contracts.map";
+
+
 
 
 /**
@@ -133,13 +138,13 @@ function daysForWindow(window: HomeWindow) {
 }
 
 // Server-local day boundary for v1 (later: member timezone)
-function startOfLocalDayIso(now: Date) {
+export function startOfLocalDayIso(now: Date) {
   const d = new Date(now);
   d.setHours(0, 0, 0, 0);
   return d.toISOString();
 }
 
-function isSyncEnabled(db: any, userId: string) {
+export function isSyncEnabled(db: any, userId: string) {
   const row = db
     .prepare("SELECT mode FROM profile_settings WHERE userId=?")
     .get(userId) as { mode?: string } | undefined;
@@ -874,8 +879,11 @@ export async function getHomeSummary(req: Request, opts: { window: HomeWindow; l
   let todaysFocus: any = null;
   let suggestion: any = null;
 
+
   const mgSummary = macroBundle?.intent?.context?.macroGap?.summary ?? null;
   const tw = macroBundle?.intent?.context?.timeWindow ?? null;
+
+  
 
   const countedRowsToday =
   opts.window === "daily" ? rows.filter((r: any) => hasAnyNumericEstimate(getEstimatesFromRow(r))).length : 0;
@@ -928,9 +936,7 @@ const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
       chips: chips.slice(0, 4),
       totals: todayTotals,
     };
-
-
-
+    
 
     suggestion =
       refinedOptions.length
@@ -959,6 +965,118 @@ const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
 
 
   }
+
+  // 1) You already have macroGap and bestNextMeal computed deterministically
+const dayKey = startOfLocalDayIso(now).slice(0, 10); // replace with your user-local dayKey util
+const userId = ctx.userId; // replace with your auth user id
+
+const dailyContractDraft = computeDailyContract({
+  userId,
+  dayKey,
+  macroGap: {
+    protein_g: mgSummary?.proteinGap_g,
+    fiber_g: mgSummary?.fiberGap_g,
+    calories_kcal: mgSummary?.caloriesRemaining,
+  },
+  bestNextMealOptions: refinedOptions.map((o: any) => ({
+    kind: o.mode === "eatout" ? "eatout" : "home",
+    title: o.title,
+    payload: o.payload ?? null,
+  })),  
+});
+
+// ---- Daily Contract Engine (deterministic, daily-only)
+let dailyContract: any = null;
+
+if (opts.window === "daily") {
+  const nowIso = now.toISOString();
+  const dayKey = startOfLocalDayIso(now).slice(0, 10);
+  const userId = ctx.userId;
+
+  // 1) try read from DB
+  const existing = getDailyContract(db, {
+    userId,
+    subjectMemberId,
+    dayKey,
+    syncMode,
+  });
+
+  // 2) if none, compute deterministic + insert
+  if (!existing) {
+    const caloriesRemaining =
+      typeof mgSummary?.caloriesRemaining === "number" ? mgSummary.caloriesRemaining : null;
+
+    const draft = computeDailyContract({
+      userId,
+      dayKey,
+      macroGap: {
+        protein_g: mgSummary?.proteinGap_g ?? 0,
+        fiber_g: mgSummary?.fiberGap_g ?? 0,
+        calories_kcal: caloriesRemaining ?? undefined,
+      },
+      bestNextMealOptions: refinedOptions.map((o: any) => ({
+        kind: o.mode === "eatout" ? "eatout" : "home",
+        title: o.title,
+        payload: null,
+      })),
+    });
+
+    // progress (deterministic evaluation)
+    const caloriesOverKcal =
+      caloriesRemaining != null && caloriesRemaining < 0 ? Math.abs(caloriesRemaining) : 0;
+
+    const evaluated = evaluateContractProgress({
+      contract: draft,
+      totals: {
+        protein_g: todayTotals?.protein_g ?? 0,
+        fiber_g: todayTotals?.fiber_g ?? 0,
+        calories_over_kcal: caloriesOverKcal,
+        clean_meals: (todayTotals as any)?.cleanMeals ?? 0,
+      },
+    });
+
+    const row = contractToRow({
+      c: evaluated,
+      userId,
+      subjectMemberId,
+      dayKey,
+      syncMode,
+      nowIso,
+      derivation: { rulesVersion: "dc.v1", mgSummary },
+    });
+
+    insertDailyContract(db, row);
+    dailyContract = rowToApi(row);
+  } else {
+    // 3) update progress each time home loads (lightweight)
+    const caloriesRemaining =
+      typeof mgSummary?.caloriesRemaining === "number" ? mgSummary.caloriesRemaining : null;
+    const caloriesOverKcal =
+      caloriesRemaining != null && caloriesRemaining < 0 ? Math.abs(caloriesRemaining) : 0;
+
+    const target = existing.adjustedTarget ?? existing.metricTarget;
+    let current = existing.progressCurrent;
+
+    if (existing.metricName === "protein_g") current = todayTotals?.protein_g ?? 0;
+    if (existing.metricName === "fiber_g") current = todayTotals?.fiber_g ?? 0;
+    if (existing.metricName === "clean_meals") current = (todayTotals as any)?.cleanMeals ?? 0;
+    if (existing.metricName === "calories_kcal") current = caloriesOverKcal;
+
+    const pct = target > 0 ? Math.max(0, Math.min(100, Math.round((current / target) * 100))) : 0;
+
+    updateDailyContractProgress(db, {
+      id: existing.id,
+      current,
+      target,
+      pct,
+      nowIso,
+    });
+
+    dailyContract = rowToApi({ ...existing, progressCurrent: current, progressTarget: target, progressPct: pct });
+  }
+}
+
+
 
   return {
     meta: {
@@ -992,5 +1110,6 @@ const planSearchKey = executionPlan?.actions?.goEatOut?.searchKey ?? null;
     todayTotals, // keep
     suggestion,
     recentLogs: { items: normalized.slice(0, opts.limit) },
+    dailyContract,
   };
 }

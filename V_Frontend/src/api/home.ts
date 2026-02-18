@@ -1,5 +1,8 @@
 // src/api/home.ts
-import { apiGet } from "../../lib/api";
+import { apiGet, apiPost } from "../../lib/api";
+import type { DailyContract, HomeSummary } from "../contracts/home";
+
+
 
 export type HomeWindow = "daily" | "3d" | "7d" | "14d";
 
@@ -82,6 +85,11 @@ export type HomeSummaryResponse = {
       score: number | null;
     }>;
   };
+
+
+  dailyContract?: DailyContract | null;
+
+  
 };
 
 function encode(params: Record<string, string | number | undefined | null>) {
@@ -122,3 +130,23 @@ export type DishOption = {
   why?: string[]; // 0–2
   route: { type: "restaurant_search"; searchKey: string } | { type: "cook_plan" };
 };
+
+export async function fetchHome(): Promise<HomeSummary> {
+  return apiGet<HomeSummary>("/home");
+}
+
+/*export async function acceptDailyContract(contractId: string): Promise<{ ok: boolean }> {
+  return apiGet<{ ok: boolean }>("/home/daily-contract/accept", {
+    method: "POST",
+    body: JSON.stringify({ contractId }),
+  } as any);
+}*/
+
+
+export async function acceptDailyContract() {
+  return apiPost("/v1/home/daily-contract/accept", {});
+}
+
+export async function adjustDailyContract(body: any) {
+  return apiPost("/v1/home/daily-contract/adjust", body);
+}

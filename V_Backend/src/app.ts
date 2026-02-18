@@ -83,6 +83,7 @@ export function createApp(db: Db) {
 // Hard separation: Sync-only AI
 app.use("/v1/sync/scan", syncScanRouter);
 app.use("/v1/sync/eatout", syncEatOutRouter());
+
   
   app.use(errorHandler());
 
